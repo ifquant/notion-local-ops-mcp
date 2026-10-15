@@ -272,6 +272,8 @@ def test_server_purge_tasks_dry_run_reports_candidates(tmp_path: Path) -> None:
         meta_path = server.store._task_dir(created["task_id"]) / "meta.json"  # noqa: SLF001
         payload = json.loads(meta_path.read_text(encoding="utf-8"))
         payload["updated_at"] = "2000-01-01T00:00:00+00:00"
+        payload["status"] = "succeeded"
+        payload["finished_at"] = "2000-01-01T00:00:00+00:00"
         meta_path.write_text(json.dumps(payload), encoding="utf-8")
 
         result = _call(server.purge_tasks, older_than_hours=1, dry_run=True)

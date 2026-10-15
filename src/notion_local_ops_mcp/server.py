@@ -8,6 +8,7 @@ from fastmcp import FastMCP
 import uvicorn
 
 from .http_compat import build_http_compat_app
+from . import config
 
 from .config import (
     APP_NAME,
@@ -62,7 +63,7 @@ from .patching import apply_patch as apply_patch_impl
 from . import relay_bridge
 from .relay_bridge import RelayBridgeSink
 from . import session
-from .pathing import resolve_cwd, resolve_path
+from .pathing import resolve_cwd, resolve_file_cwd, resolve_path
 from .search import glob_files as glob_files_impl
 from .search import grep_files as grep_files_impl
 from .shell import run_command as run_command_impl
@@ -82,10 +83,19 @@ registry = ExecutorRegistry(
 )
 
 MCP_INSTRUCTIONS = (
+    "Pass explicit cwd for every project operation; the legacy default cwd is process-wide. "
     "Use direct tools first for normal tasks. Prioritize apply_patch/write_file for edits and "
     "run_command_stream/wait_task for long-running shell work. "
     "Use search/read_text for focused repo discovery and reading, not as a substitute for every shell step. "
     "Use git_* only when the current cwd is actually inside a git repository. "
+    "Before edits, inspect the project baseline; afterward re-read changed files, inspect the diff, and run verification. "
+    "Follow next_cursor and deferred reads instead of treating partial content as complete; on file_changed, re-read. "
+    "On wait_timed_out, continue querying the same task_id, never resubmit the command. "
+    "If a submission response is lost, its outcome is unknown: do not blindly retry side-effecting commands. "
+    "On capacity_exceeded, retry later without busy polling. On partial write failure, re-read before repair. "
+    "On cleanup_failed or control_unavailable, do not assume the process stopped. "
+    "Read remaining logs while has_more is true even after completed; disclose output truncation. "
+    "Report completion only when the requested change and its verification both succeed. "
     "Use delegate_task only when direct tools are insufficient for a complex, long-running, or multi-file task."
 )
 
@@ -160,6 +170,7 @@ OPEN_WORLD_WRITE_TOOL = {
     annotations=READ_ONLY_TOOL,
     description=(
         "List project and global agent skills as lightweight summaries. "
+        "Pass cwd for project discovery; omitted cwd uses WORKSPACE_ROOT, not shared default cwd. "
         "Returns skill name, description, preferred path, and source locations. "
         "Use namespace ('agents' | 'codex' | 'claude') to scope, name_pattern "
         "(fnmatch, e.g. 'git-*') to filter by skill name, and "
@@ -173,15 +184,18 @@ def list_skills(
     namespace: str | None = None,
     name_pattern: str | None = None,
     description_max_length: int | None = None,
+    cwd: str | None = None,
 ) -> dict[str, object]:
-    return list_skills_impl(
-        workspace_root=WORKSPACE_ROOT,
+    base = resolve_file_cwd(cwd, WORKSPACE_ROOT)
+    result = list_skills_impl(
+        workspace_root=base,
         include_project=include_project,
         include_global=include_global,
         namespace=namespace,
         name_pattern=name_pattern,
         description_max_length=description_max_length,
     )
+    return {**result, "resolved_cwd": str(base)}
 
 
 @mcp.tool(
@@ -193,7 +207,8 @@ def list_skills(
         "(.git / .venv / node_modules / __pycache__ / ...) and .gitignore'd "
         "paths are excluded by default. Set include_hidden=True or "
         "respect_gitignore=False to see them; add exclude_patterns for "
-        "fnmatch-style patterns (matched against both name and relative path)."
+        "fnmatch-style patterns (matched against both name and relative path). "
+        "Pass cwd for relative paths; omitted cwd preserves WORKSPACE_ROOT."
     ),
 )
 @traced("list_files", result_fn=_read_result_summary)
@@ -205,9 +220,13 @@ def list_files(
     include_hidden: bool = False,
     respect_gitignore: bool = True,
     exclude_patterns: list[str] | None = None,
+    cwd: str | None = None,
 ) -> dict[str, object]:
-    target = resolve_path(path or ".", WORKSPACE_ROOT)
-    return list_files_impl(
+    if limit <= 0 or offset < 0:
+        return {"success": False, "error": {"code": "invalid_arguments", "message": "limit must be positive; offset must be non-negative."}}
+    base = resolve_file_cwd(cwd, WORKSPACE_ROOT)
+    target = resolve_path(path or ".", base)
+    result = list_files_impl(
         target,
         recursive=recursive,
         limit=limit,
@@ -216,6 +235,7 @@ def list_files(
         respect_gitignore=respect_gitignore,
         exclude_patterns=exclude_patterns,
     )
+    return {**result, "resolved_cwd": str(base)}
 
 
 @mcp.tool(
@@ -224,6 +244,7 @@ def list_files(
     annotations=READ_ONLY_TOOL,
     description=(
         "Canonical search tool that unifies glob, regex grep, and plain-text search. "
+        "Pass cwd for relative paths; omitted cwd preserves WORKSPACE_ROOT. "
         "Use mode='glob' for path discovery, mode='regex' for code/text regex, and "
         "mode='text' for literal substring search. Hidden entries and .gitignore'd "
         "paths are excluded by default; regex/text search also accept a single file path."
@@ -246,8 +267,12 @@ def search(
     include_hidden: bool = False,
     respect_gitignore: bool = True,
     exclude_patterns: list[str] | None = None,
+    cwd: str | None = None,
 ) -> dict[str, object]:
-    target = resolve_path(path or ".", WORKSPACE_ROOT)
+    if limit <= 0 or offset < 0 or before < 0 or after < 0:
+        return {"success": False, "error": {"code": "invalid_arguments", "message": "limit must be positive; offset/before/after must be non-negative."}}
+    base = resolve_file_cwd(cwd, WORKSPACE_ROOT)
+    target = resolve_path(path or ".", base)
 
     if mode == "glob":
         if not pattern:
@@ -266,6 +291,7 @@ def search(
         )
         if isinstance(result, dict):
             result["mode"] = mode
+            result["resolved_cwd"] = str(base)
         return result
 
     if mode in {"regex", "text"}:
@@ -303,6 +329,7 @@ def search(
         )
         if isinstance(result, dict):
             result["mode"] = mode
+            result["resolved_cwd"] = str(base)
             if mode == "text" and query is not None:
                 result["query"] = query
         return result
@@ -323,7 +350,9 @@ def search(
     description=(
         "Canonical text-reader tool. Pass either `path` for single-file reads or "
         "`paths` for batch reads. Pagination is line-based via start_line/line_limit. "
-        "Set include_line_numbers=true when evidence or code-review output needs numbered lines."
+        "Prefer returned next_cursor to continue, especially for partial long lines; do not combine cursor and start_line. "
+        "Batch deferred entries must be read separately. Pass cwd for project-relative paths. "
+        "Set include_line_numbers=true for evidence. Invalid UTF-8 is rejected."
     ),
 )
 @traced("read_text", result_fn=_read_result_summary)
@@ -333,7 +362,10 @@ def read_text(
     start_line: int | None = None,
     line_limit: int | None = None,
     include_line_numbers: bool = False,
+    cwd: str | None = None,
+    cursor: str | None = None,
 ) -> dict[str, object]:
+    base = resolve_file_cwd(cwd, WORKSPACE_ROOT)
     has_path = bool(path)
     has_paths = bool(paths)
     if has_path == has_paths:
@@ -348,30 +380,35 @@ def read_text(
     effective_offset = start_line
     effective_limit = line_limit
     if path:
-        target = resolve_path(path, WORKSPACE_ROOT)
+        target = resolve_path(path, base)
         result = read_file_impl(
             target,
             offset=effective_offset,
             limit=effective_limit,
             max_lines=200,
-            max_bytes=32768,
+            max_bytes=config.READ_MAX_BYTES,
             include_line_numbers=include_line_numbers,
+            cursor=cursor,
         )
         if isinstance(result, dict):
             result["mode"] = "single"
+            result["resolved_cwd"] = str(base)
         return result
 
-    targets = [resolve_path(item, WORKSPACE_ROOT) for item in (paths or [])]
+    if cursor is not None:
+        return {"success": False, "error": {"code": "invalid_arguments", "message": "Use cursor with a single path."}}
+    targets = [resolve_path(item, base) for item in (paths or [])]
     result = read_files_impl(
         targets,
         offset=effective_offset,
         limit=effective_limit,
         max_lines=200,
-        max_bytes=32768,
+        max_bytes=config.READ_MAX_BYTES,
         include_line_numbers=include_line_numbers,
     )
     if isinstance(result, dict):
         result["mode"] = "batch"
+        result["resolved_cwd"] = str(base)
     return result
 
 
@@ -379,12 +416,13 @@ def read_text(
     name="write_file",
     title="Write File",
     annotations=LOCAL_WRITE_TOOL,
-    description="Write full content to a file (supports dry_run preview without touching disk).",
+    description="Write full content to a file (supports dry_run). Pass cwd for project-relative paths; omitted cwd preserves WORKSPACE_ROOT. On write failure reread the target because partial writes are possible.",
 )
 @traced("write_file", result_fn=_write_file_result_summary)
-def write_file(path: str, content: str, dry_run: bool = False) -> dict[str, object]:
-    target = resolve_path(path, WORKSPACE_ROOT)
-    return write_file_impl(target, content=content, dry_run=dry_run)
+def write_file(path: str, content: str, dry_run: bool = False, cwd: str | None = None) -> dict[str, object]:
+    base = resolve_file_cwd(cwd, WORKSPACE_ROOT)
+    target = resolve_path(path, base)
+    return {**write_file_impl(target, content=content, dry_run=dry_run), "resolved_cwd": str(base)}
 
 
 @mcp.tool(
@@ -393,6 +431,7 @@ def write_file(path: str, content: str, dry_run: bool = False) -> dict[str, obje
     annotations=LOCAL_WRITE_TOOL,
     description=(
         "Apply a structured patch using *** Begin Patch / *** Update File blocks. "
+        "Pass cwd for relative source and move-target paths. Multi-file writes are not atomic; inspect partial failure details. "
         "Each @@ hunk must contain at least one '+' or '-' line and must "
         "match exactly one location in the target file; pure-context hunks are rejected."
     ),
@@ -407,14 +446,17 @@ def apply_patch(
     dry_run: bool = False,
     validate_only: bool = False,
     return_diff: bool = False,
+    cwd: str | None = None,
 ) -> dict[str, object]:
-    return apply_patch_impl(
+    base = resolve_file_cwd(cwd, WORKSPACE_ROOT)
+    result = apply_patch_impl(
         patch=patch,
-        workspace_root=WORKSPACE_ROOT,
+        workspace_root=base,
         dry_run=dry_run,
         validate_only=validate_only,
         return_diff=return_diff,
     )
+    return {**result, "resolved_cwd": str(base)}
 
 
 @mcp.tool(
@@ -466,6 +508,11 @@ async def server_info() -> dict[str, object]:
         },
         "tools": tools,
         "tool_count": len(tools),
+        "limits": {name.lower(): getattr(config, name) for name in (
+            "READ_MAX_LINES", "READ_MAX_BYTES", "READ_BATCH_FILES", "READ_BATCH_BYTES",
+            "LOG_READ_BYTES", "LOG_RETAIN_BYTES", "COMMAND_OUTPUT_BYTES", "MAX_EXECUTIONS",
+            "MAX_WAIT_SECONDS", "TERM_GRACE_SECONDS", "KILL_GRACE_SECONDS")},
+        "process_groups_supported": os.name == "posix",
     }
 
 
@@ -474,7 +521,7 @@ async def server_info() -> dict[str, object]:
     title="Set Default CWD",
     annotations=LOCAL_STATE_TOOL,
     description=(
-        "Set the session-wide default working directory used whenever a tool call "
+        "Set the PROCESS-WIDE shared default working directory used whenever a Shell/Git tool call "
         "omits `cwd`. Pass null (or omit path) to clear the override and fall back to "
         "the server's workspace root. Useful when running many commands in the same "
         "repo: set it once instead of passing `cwd` on every call."
@@ -523,7 +570,7 @@ def set_default_cwd(path: str | None = None) -> dict[str, object]:
     title="Get Default CWD",
     annotations=READ_ONLY_TOOL,
     description=(
-        "Return the currently active default working directory and whether it comes "
+        "Return the PROCESS-WIDE shared default working directory and whether it comes "
         "from the session override (set_default_cwd) or from the server's workspace root."
     ),
 )
@@ -730,6 +777,8 @@ def run_command_stream(
         cwd=resolved_cwd,
         timeout=effective_timeout,
     )
+    if "task_id" not in queued:
+        return queued
     queued["stream_mode"] = "task-polling"
     queued["next"] = "call get_task(task_id) or wait_task(task_id)"
     return queued
@@ -767,7 +816,7 @@ def delegate_task(
         executor=executor,
         cwd=resolved_cwd,
         timeout=timeout if timeout is not None else DELEGATE_TIMEOUT,
-        context_files=context_files,
+        context_files=[str(resolve_path(item, resolved_cwd)) for item in (context_files or [])],
         acceptance_criteria=acceptance_criteria,
         verification_commands=verification_commands,
         commit_mode=commit_mode,
@@ -780,29 +829,32 @@ def delegate_task(
     name="get_task",
     title="Get Task",
     annotations=READ_ONLY_TOOL,
-    description="Get the current status and output tail for a delegated or background shell task.",
+    description="Get task status and bounded output. Omit cursor for legacy tails, use cursor='start' to read from the beginning, then next_cursor for incremental reads. completed and has_more are independent. output_truncated means excess log data was discarded.",
 )
 @traced("get_task", result_fn=_task_result_summary)
-def get_task(task_id: str) -> dict[str, object]:
-    return registry.get(task_id)
+def get_task(task_id: str, cursor: str | None = None, max_bytes: int = config.LOG_READ_BYTES) -> dict[str, object]:
+    return registry.get(task_id, cursor=cursor, max_bytes=max_bytes)
 
 
 @mcp.tool(
     name="wait_task",
     title="Wait Task",
     annotations=READ_ONLY_TOOL,
-    description="Wait for a delegated or background shell task to finish or until timeout, then return its latest status and output tail.",
+    description="Wait up to 30 seconds (zero polls immediately) for task completion; return_on_output also wakes on new output. Pass cursor from get_task for incremental logs. wait_timed_out does not cancel execution; execution_timed_out records the command deadline separately.",
 )
 @traced("wait_task", result_fn=_task_result_summary)
-def wait_task(task_id: str, timeout: float = 30, poll_interval: float = 0.5) -> dict[str, object]:
-    return registry.wait(task_id, timeout=timeout, poll_interval=poll_interval)
+def wait_task(task_id: str, timeout: float = 30, poll_interval: float = 0.5,
+              cursor: str | None = None, max_bytes: int = config.LOG_READ_BYTES,
+              return_on_output: bool = False) -> dict[str, object]:
+    return registry.wait(task_id, timeout=timeout, poll_interval=poll_interval,
+                         cursor=cursor, max_bytes=max_bytes, return_on_output=return_on_output)
 
 
 @mcp.tool(
     name="cancel_task",
     title="Cancel Task",
     annotations=LOCAL_WRITE_TOOL,
-    description="Cancel a delegated or background shell task if it is still running.",
+    description="Request process-group cancellation and wait briefly for confirmed cleanup. cancelled=true only after confirmed termination; cancel_requested alone is not completion. Terminal tasks keep their result. Unowned tasks cannot be cancelled by this process.",
 )
 @traced("cancel_task", result_fn=_task_result_summary)
 def cancel_task(task_id: str) -> dict[str, object]:
@@ -814,14 +866,14 @@ def cancel_task(task_id: str) -> dict[str, object]:
     title="Purge Tasks",
     annotations=LOCAL_WRITE_TOOL,
     description=(
-        "Delete old task metadata/log directories under STATE_DIR/tasks. "
+        "Delete old terminal task metadata/log directories under STATE_DIR/tasks. Active, corrupt and linked tasks are skipped. "
         "Defaults to 7 days; supports dry_run preview."
     ),
 )
 @traced("purge_tasks", result_fn=_purge_result_summary)
 def purge_tasks(older_than_hours: float = 24 * 7, dry_run: bool = False) -> dict[str, object]:
     return store.purge_tasks(
-        older_than_seconds=max(float(older_than_hours), 0.0) * 3600.0,
+        older_than_seconds=float(older_than_hours) * 3600.0,
         dry_run=dry_run,
     )
 

@@ -25,3 +25,11 @@ def resolve_cwd(cwd: str | None, workspace_root: Path) -> Path:
     if session_cwd is not None:
         return session_cwd
     return workspace_root
+
+
+def resolve_file_cwd(cwd: str | None, workspace_root: Path) -> Path:
+    """Explicit per-call file base; legacy calls never use the shared override."""
+    base = resolve_path(cwd, workspace_root) if cwd is not None else workspace_root
+    if not base.is_dir():
+        raise ValueError(f"cwd must be an existing directory: {base}")
+    return base

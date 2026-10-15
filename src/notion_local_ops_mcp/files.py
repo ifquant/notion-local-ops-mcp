@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import difflib
+import base64
+import json
 import mimetypes
 import os
 import subprocess
 from fnmatch import fnmatch
 from pathlib import Path
+
+from .config import READ_MAX_LINES, READ_MAX_BYTES, READ_BATCH_FILES, READ_BATCH_BYTES
 
 
 # Directories we almost never want to return to an agent. Used as a default
@@ -294,44 +298,115 @@ def read_file(
     max_lines: int,
     max_bytes: int,
     include_line_numbers: bool = False,
+    cursor: str | None = None,
 ) -> dict[str, object]:
     if not path.exists():
         return _error("file_not_found", f"File not found: {path}", resolved_path=str(path))
     if not path.is_file():
         return _error("not_a_file", f"Path is not a file: {path}", resolved_path=str(path))
 
+    start = 1 if offset is None else offset
+    line_limit = max_lines if limit is None else limit
+    if (not isinstance(start, int) or isinstance(start, bool) or start < 1
+            or not isinstance(line_limit, int) or isinstance(line_limit, bool)
+            or not 1 <= line_limit <= READ_MAX_LINES or max_bytes < 1):
+        return _error("invalid_arguments", f"start_line must be positive; line_limit must be 1..{READ_MAX_LINES}.")
+    if cursor is not None and offset is not None:
+        return _error("invalid_arguments", "cursor and start_line are mutually exclusive.")
+    budget = min(max_bytes, READ_MAX_BYTES)
+    current_line, column, position = start, 0, 0
+    parts: list[str] = []
+    used = 0
+    separator_after = ""
     try:
-        text = _read_text(path)
-    except ValueError as exc:
-        return _error("not_text_file", str(exc), resolved_path=str(path))
-
-    lines = text.splitlines()
-    start = max(offset or 1, 1)
-    line_limit = max(limit or max_lines, 1)
-    selected = lines[start - 1 : start - 1 + line_limit]
-    content = _render_lines(
-        selected,
-        start_line=start,
-        include_line_numbers=include_line_numbers,
-    )
-    truncated = start - 1 + line_limit < len(lines)
-
-    encoded = content.encode("utf-8")
-    if len(encoded) > max_bytes:
-        content = encoded[:max_bytes].decode("utf-8", errors="ignore")
-        truncated = True
+        stat = path.stat()
+        version = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+        if cursor is not None:
+            try:
+                if len(cursor) > 8192:
+                    raise ValueError()
+                data = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+                if data["path"] != str(path.resolve()):
+                    raise ValueError()
+                position, current_line, column = data["position"], data["line"], data["column"]
+                if any(type(n) is not int or n < 0 for n in (position, current_line, column)) or current_line < 1:
+                    raise ValueError()
+                if data["version"] != version:
+                    return _error("file_changed", "File changed since the previous page; restart reading.", path=str(path))
+                start = current_line
+            except (ValueError, KeyError, TypeError, UnicodeError):
+                return _error("invalid_cursor", "Invalid cursor or cursor belongs to another file.")
+        with path.open("r", encoding="utf-8", errors="strict", newline=None) as handle:
+            if cursor is not None:
+                handle.seek(position)
+            else:
+                # Bounded chunks even when skipped lines are extremely long.
+                skipped = 1
+                while skipped < start:
+                    chunk = handle.readline(8192)
+                    if not chunk:
+                        break
+                    skipped += chunk.endswith("\n")
+            while current_line - start < line_limit:
+                before = handle.tell()
+                char = handle.read(1)
+                if not char:
+                    break
+                if char == "\x00":
+                    return _error("not_text_file", "Binary files are not supported.", path=str(path))
+                prefix = f"{current_line}: " if include_line_numbers and column == 0 else ""
+                size = len((prefix + char).encode("utf-8"))
+                if used + size > budget:
+                    handle.seek(before)
+                    break
+                parts.append(prefix + char)
+                used += size
+                if char == "\n":
+                    current_line += 1
+                    column = 0
+                else:
+                    column += 1
+            position = handle.tell()
+            truncated = bool(handle.read(1))
+        after = path.stat()
+        if version != [after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns]:
+            return _error("file_changed", "File changed while reading; restart reading.", path=str(path))
+    except UnicodeError:
+        return _error("not_text_file", "Invalid UTF-8; convert the file encoding before reading.", path=str(path))
+    except (OSError, ValueError, OverflowError) as exc:
+        return _error("read_failed", str(exc)[:1000], path=str(path))
+    if truncated and not parts:
+        return _error("output_budget_too_small", "Budget cannot fit the next character and line prefix.", path=str(path))
+    content = "".join(parts)
+    if content.endswith("\n"):
+        content = content[:-1]
+        separator_after = "\n"
+    next_cursor = None
+    if truncated:
+        next_cursor = base64.urlsafe_b64encode(json.dumps({
+            "path": str(path.resolve()), "version": version, "position": position,
+            "line": current_line, "column": column,
+        }, separators=(",", ":")).encode()).decode()
 
     language = (mimetypes.guess_type(str(path))[0] or "").split("/")[-1] or path.suffix.lstrip(".")
     if not language:
         language = "text"
-    end_line = start + len(selected) - 1 if selected else start - 1
+    end_line = current_line - 1 if column == 0 else current_line
+    if not parts:
+        end_line = start - 1
 
     return {
         "success": True,
         "path": str(path),
         "content": content,
         "truncated": truncated,
-        "next_offset": start + len(selected) if truncated and selected else None,
+        "next_offset": current_line if truncated and column == 0 else None,
+        "next_cursor": next_cursor,
+        "partial_line": truncated and column != 0,
+        "separator_after": separator_after,
+        "bytes_returned": len(content.encode("utf-8")),
+        "file_version": version,
+        "truncation_reason": ("line_limit" if current_line - start >= line_limit else "byte_limit") if truncated else None,
         "offset_unit": "lines",
         "start_line": start,
         "end_line": end_line,
@@ -348,28 +423,44 @@ def read_files(
     max_lines: int,
     max_bytes: int,
     include_line_numbers: bool = False,
+    total_max_bytes: int = READ_BATCH_BYTES,
 ) -> dict[str, object]:
-    results = [
-        read_file(
+    if len(paths) > READ_BATCH_FILES:
+        return _error("too_many_files", f"Read at most {READ_BATCH_FILES} files per call.", limit=READ_BATCH_FILES)
+    results = []
+    if type(total_max_bytes) is not int or total_max_bytes <= 0:
+        return _error("invalid_arguments", "total_max_bytes must be positive")
+    remaining = min(total_max_bytes, READ_BATCH_BYTES)
+    for path in paths:
+        if remaining < 16:
+            results.append({"success": False, "path": str(path), "deferred": True,
+                            "reason": "batch_byte_budget", "next_start_line": offset or 1})
+            continue
+        result = read_file(
             path,
             offset=offset,
             limit=limit,
             max_lines=max_lines,
-            max_bytes=max_bytes,
+            max_bytes=min(max_bytes, remaining),
             include_line_numbers=include_line_numbers,
         )
-        for path in paths
-    ]
+        remaining -= len(str(result.get("content", "")).encode("utf-8"))
+        results.append(result)
     return {
         "success": all(result.get("success") is True for result in results),
         "results": results,
+        "bytes_returned": min(total_max_bytes, READ_BATCH_BYTES) - remaining,
     }
 
 
 def write_file(path: Path, *, content: str, dry_run: bool = False) -> dict[str, object]:
     if not dry_run:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            return _error("write_failed", str(exc)[:1000], path=str(path), written=False,
+                          may_be_partially_written=True, requires_reread=True)
     return {
         "success": True,
         "path": str(path),

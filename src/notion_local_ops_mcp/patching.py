@@ -490,8 +490,17 @@ def apply_patch(
 
         should_apply = not dry_run and not validate_only
         if should_apply:
-            for change in planned_changes:
-                _apply_change(change)
+            applied_files = []
+            for index, change in enumerate(planned_changes):
+                try:
+                    _apply_change(change)
+                    applied_files.append(str(change.path))
+                except OSError as exc:
+                    return _error("patch_write_failed", str(exc)[:1000], applied=False,
+                                  applied_files=applied_files, failed_file=str(change.path),
+                                  previous_path=str(change.previous_path) if change.previous_path else None,
+                                  may_be_partially_written=True, requires_reread=True,
+                                  not_applied_files=[str(item.path) for item in planned_changes[index + 1:]])
 
         payload: dict[str, object] = {
             "success": True,
@@ -506,3 +515,5 @@ def apply_patch(
         return payload
     except PatchError as exc:
         return _error(exc.code, str(exc), **exc.extra)
+    except OSError as exc:
+        return _error("patch_read_failed", str(exc)[:1000], applied=False)

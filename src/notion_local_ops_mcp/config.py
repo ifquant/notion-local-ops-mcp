@@ -34,6 +34,26 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _positive_limit(name: str, default: int) -> int:
+    value = int(os.environ.get(f"NOTION_LOCAL_OPS_{name}", str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+READ_MAX_LINES = _positive_limit("READ_MAX_LINES", 2000)
+READ_MAX_BYTES = _positive_limit("READ_MAX_BYTES", 32768)
+READ_BATCH_FILES = _positive_limit("READ_BATCH_FILES", 16)
+READ_BATCH_BYTES = _positive_limit("READ_BATCH_BYTES", 65536)
+LOG_READ_BYTES = _positive_limit("LOG_READ_BYTES", 32768)
+LOG_RETAIN_BYTES = _positive_limit("LOG_RETAIN_BYTES", 16 * 1024 * 1024)
+COMMAND_OUTPUT_BYTES = _positive_limit("COMMAND_OUTPUT_BYTES", 32768)
+MAX_EXECUTIONS = _positive_limit("MAX_EXECUTIONS", 4)
+MAX_WAIT_SECONDS = _positive_limit("MAX_WAIT_SECONDS", 30)
+TERM_GRACE_SECONDS = _positive_limit("TERM_GRACE_SECONDS", 2)
+KILL_GRACE_SECONDS = _positive_limit("KILL_GRACE_SECONDS", 2)
+
+
 APP_NAME = "notion-local-ops-mcp"
 HOST = os.environ.get("NOTION_LOCAL_OPS_HOST", "127.0.0.1")
 PORT = int(os.environ.get("NOTION_LOCAL_OPS_PORT", "8766"))

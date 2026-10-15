@@ -550,7 +550,8 @@ def _task_result_summary(result: object) -> dict[str, object] | None:
     err = result.get("error")
     if isinstance(err, dict) and "code" in err:
         summary["error_code"] = err["code"]
-    for key in ("task_id", "executor", "status", "completed", "cancelled", "timed_out"):
+    for key in ("task_id", "executor", "status", "completed", "cancelled", "timed_out",
+                "wait_timed_out", "execution_timed_out", "output_truncated", "cleanup_failed"):
         if key in result:
             summary[key] = result[key]
     stdout_tail = result.get("stdout_tail")

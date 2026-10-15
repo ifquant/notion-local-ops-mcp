@@ -129,7 +129,7 @@ Working style:
 Tool strategy:
 - list_skills: use when the user asks what skills are available in this repo or globally.
 - server_info: call first when troubleshooting connection/runtime mismatches.
-- set_default_cwd / get_default_cwd: set once for repeated repo operations instead of passing cwd every time.
+- Pass explicit cwd for every project operation, including files/search/patch/skills/Shell/Git. set_default_cwd / get_default_cwd are legacy PROCESS-WIDE state shared by all clients; file tools without cwd still use WORKSPACE_ROOT.
 - In coding tasks, search the local repo first. Do not default to searching the Notion workspace.
 - apply_patch: use this as the default edit tool for existing files, including small edits, multi-hunk edits, moves, deletes, or adds in one patch. Each @@ hunk must include at least one '+' or '-' line and must match exactly one location in the file. Use dry_run=true, validate_only=true, or return_diff=true when you want validation or a preview before writing.
 - write_file: create new files or rewrite short files when that is simpler than patching; use dry_run=true for no-write preview.
@@ -148,14 +148,23 @@ Execution rules:
 - When exploring a codebase, prefer search(mode='glob' or 'regex') over broad list_files calls.
 - Follow the loop: probe, edit, verify, summarize.
 - Do the minimum necessary read/explore work before editing.
-- After each edit, re-read the changed section or run a minimal verification command when useful.
+- Before editing, inspect the project baseline and preserve unrelated changes. After editing, re-read changed sections, inspect the diff, and run relevant verification.
 - Prefer apply_patch for edits to existing files; reserve write_file for new files or full rewrites.
 - Do not issue parallel writes to the same file.
-- After a logically meaningful change, inspect git_status and git_diff, then create a small focused commit instead of waiting until the end.
+- After a logically meaningful change, inspect git_status and git_diff. Commit only when the user or applicable repository rules authorize it; do not automatically commit during acceptance testing.
 - Use focused commits. Do not mix unrelated changes in one commit.
 - Use clear commit messages, preferably conventional commit style such as fix, feat, docs, test, refactor, or chore.
 - For destructive actions such as deleting files, resetting changes, or dangerous shell commands, ask first.
 - If a command or delegated task fails, summarize the root cause and adjust the approach instead of retrying blindly.
+
+Reliability rules:
+- Follow next_cursor and deferred reads; partial content is not the whole file. On file_changed, re-read before continuing.
+- On wait_timed_out, keep the same task_id and continue querying; never restart the command just because waiting timed out.
+- If a submission response is lost, the outcome is unknown. Do not blindly resubmit side-effecting commands; first reconcile available records or ask for help.
+- On capacity_exceeded, retry later without busy polling. On partial write failure, re-read affected files and inspect the diff before repair; do not replay the entire patch.
+- cancel_requested is not confirmed termination. On cleanup_failed or control_unavailable, report uncertainty and stop steps that depend on the process having exited.
+- Even after completed=true, continue reading while has_more=true. Disclose output truncation; never treat missing logs as proof of success.
+- Report completion only when the requested change and its verification both succeed. Do not repeat unchanged failing commands. First-stage Notion acceptance uses direct tools, not delegate_task.
 
 Verification rules:
 - After code changes, prefer this minimum verification ladder when applicable:
@@ -433,7 +442,7 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 - `write_file`: write full file content, supports `dry_run`
 - `apply_patch`: default edit tool for existing files; uses `*** Begin Patch` / `*** Update File` syntax, rejects pure-context hunks, requires unique context matches, and returns per-file change stats/warnings
 - `server_info`: inspect runtime config and the registered MCP tool list
-- `set_default_cwd`: set session default working directory for subsequent calls
+- `set_default_cwd`: set the process-wide shared Shell/Git default directory; prefer explicit `cwd`
 - `get_default_cwd`: inspect current session/effective working directory
 - `git_status`: structured repository status (use when cwd is inside a git repo)
 - `git_diff`: structured diff output grouped by file with per-file truncation
@@ -472,6 +481,52 @@ When enabled, the server log includes `MCP_DEBUG` lines with:
 - response status and duration
 
 ## Verify
+
+### Phase 1 tool contracts
+
+Use explicit `cwd` on each files/search/patch/skills/Shell/Git call. Relative `cwd` is anchored at `WORKSPACE_ROOT`; relative file paths use that call's directory. Absolute file paths remain absolute. Legacy file calls without `cwd` still use `WORKSPACE_ROOT`; legacy Shell/Git calls use the shared process default. This is not per-conversation isolation.
+
+Example MCP arguments for `read_text`:
+
+```json
+{"cwd":"/absolute/path/to/project","path":"src/app.py","start_line":1,"line_limit":200}
+```
+
+Continue using the returned cursor, without `start_line`:
+
+```json
+{"cwd":"/absolute/path/to/project","path":"src/app.py","cursor":"<next_cursor>"}
+```
+
+`partial_line` means a long line is incomplete; `next_offset` is then null. `file_changed` requires restarting the read. Invalid UTF-8 is rejected. Newlines are normalized to LF; concatenate `content + separator_after` with line numbering disabled to reconstruct pages. Batch `deferred` entries were not read; retry those paths with their `next_start_line`.
+
+`write_file` and `apply_patch` accept the same explicit `cwd`. Example dry-run write:
+
+```json
+{"cwd":"/absolute/path/to/project","path":"notes.txt","content":"verified\n","dry_run":true}
+```
+
+Start a command using `run_command_stream`:
+
+```json
+{"cwd":"/absolute/path/to/project","command":"python3 -u -c \"import time; print('STARTED'); time.sleep(3); print('DONE')\"","timeout":20}
+```
+
+Read live output with `wait_task`, then replace `start` with the returned `next_cursor`:
+
+```json
+{"task_id":"<task_id>","cursor":"start","return_on_output":true,"timeout":10,"max_bytes":32768}
+```
+
+`get_task` accepts the same cursor and byte budget without waiting. Omitting cursor retains bounded legacy tails. `completed` and `has_more` are independent. Ordering is preserved within each output stream, not globally between stdout and stderr. Programs must flush their own buffered output.
+
+`wait_timed_out` does not stop execution; `execution_timed_out` records the command deadline. The legacy `timed_out` field keeps its wait meaning in `wait_task` and execution meaning in `get_task`; prefer the explicit fields. Wait in calls of at most 30 seconds.
+
+Cancel with `cancel_task({"task_id":"<task_id>"})`. `cancel_requested` is not confirmed termination: check `cancelled` and `completed`. Cancellation uses TERM then KILL on the managed POSIX process group. Completed tasks retain their result. Unconfirmed cleanup reports `cleanup_failed` and retains its execution slot; unowned active records report `control_unavailable`. Interactive stdin/PTY, detached daemons, cross-restart takeover and non-POSIX execution are not supported by this phase.
+
+Defaults: 32 KiB per file / 2,000 lines maximum, 16 files / 64 KiB per batch, 32 KiB per log query, 16 MiB retained logs per task, four concurrent executions per server process. A full log continues draining but drops excess output and reports `output_truncated` / `dropped_bytes`. Synchronous command output is capped at 32 KiB; command/task input at 64 KiB. See `.env.example` and `server_info.limits`. Requests above hard limits fail explicitly. Cleanup skips active, corrupt and linked tasks. Multi-file patches are not atomic: inspect partial failure details and reread affected files before retrying.
+
+See the [implementation plan](docs/notion-code-agent-plan.zh-CN.md) and [verification record](docs/phase1-verification.zh-CN.md) for local versus real Notion acceptance.
 
 ```bash
 source .venv/bin/activate

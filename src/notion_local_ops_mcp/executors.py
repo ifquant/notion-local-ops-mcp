@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shlex
@@ -13,6 +14,8 @@ from pathlib import Path
 from pathlib import PureWindowsPath
 
 from .tasks import TaskStore
+from .config import LOG_RETAIN_BYTES, LOG_READ_BYTES, MAX_WAIT_SECONDS
+from .execution import EXECUTION_SLOTS, ProcessControl, run_process, validate_seconds
 
 
 TERMINAL_TASK_STATUSES = {"succeeded", "failed", "cancelled"}
@@ -126,401 +129,229 @@ class Invocation:
 
 
 class ExecutorRegistry:
-    def __init__(self, *, store: TaskStore, codex_command: str | None, claude_command: str | None) -> None:
+    def __init__(self, *, store: TaskStore, codex_command: str | None, claude_command: str | None,
+                 slots=None, log_limit: int = LOG_RETAIN_BYTES) -> None:
         self.store = store
         self.codex_command = codex_command
         self.claude_command = claude_command
-        self._lock = threading.Lock()
-        self._processes: dict[str, subprocess.Popen[str]] = {}
-        self._cancel_events: dict[str, threading.Event] = {}
+        self.slots = slots if slots is not None else EXECUTION_SLOTS
+        self.log_limit = log_limit
+        self._lock = threading.RLock()
+        self._changed = threading.Condition(self._lock)
+        self._generation = 0
+        self._controls: dict[str, ProcessControl] = {}
         self._completion_events: dict[str, threading.Event] = {}
+        self._failures: dict[str, dict[str, object]] = {}
 
-    def _register_task(self, task_id: str) -> tuple[threading.Event, threading.Event]:
-        cancel_event = threading.Event()
-        completion_event = threading.Event()
-        with self._lock:
-            self._cancel_events[task_id] = cancel_event
-            self._completion_events[task_id] = completion_event
-        return cancel_event, completion_event
+    def _notify(self) -> None:
+        with self._changed:
+            self._generation += 1
+            self._changed.notify_all()
 
-    def _mark_completed(self, task_id: str) -> None:
-        with self._lock:
-            event = self._completion_events.get(task_id)
-        if event is not None:
-            event.set()
+    def _persist(self, task_id: str, **fields) -> None:
+        try:
+            self.store.update(task_id, **fields)
+        except Exception as exc:
+            logging.error("Task %s metadata write failed: %s", task_id, exc)
+            with self._lock:
+                self._failures[task_id] = {
+                    "task_id": task_id, "status": fields.get("status", "running"),
+                    "persistence_error": str(exc)[:1000], "error": "metadata_write_failed",
+                    **fields,
+                }
+            raise
+        finally:
+            self._notify()
 
-    def submit(
-        self,
-        *,
-        task: str | None,
-        goal: str | None = None,
-        executor: str,
-        cwd: Path,
-        timeout: int,
-        context_files: list[str] | None = None,
-        acceptance_criteria: list[str] | None = None,
-        verification_commands: list[str] | None = None,
-        commit_mode: str = "allowed",
-        output_schema: dict[str, object] | None = None,
-        parse_structured_output: bool = True,
-    ) -> dict[str, object]:
-        normalized_task = (task or "").strip()
-        normalized_goal = (goal or "").strip()
-        if not normalized_task and not normalized_goal:
+    def _submit(self, *, task: str, executor: str, cwd: Path, timeout: float,
+                invocation_factory, context_files=None, metadata=None, parse=True) -> dict[str, object]:
+        try:
+            validate_seconds(timeout)
+            if len(json.dumps({"task": task, "context_files": context_files, "metadata": metadata}, ensure_ascii=False).encode()) > 65536:
+                raise ValueError("Task input exceeds 64 KiB; put large context in files and pass paths.")
+        except (ValueError, TypeError) as exc:
+            return {"success": False, "error": {"code": "invalid_arguments", "message": str(exc)}}
+        cwd_error = _cwd_error(task, cwd)
+        if cwd_error:
+            return cwd_error
+        if not self.slots.acquire(blocking=False):
+            return {"success": False, "error": {"code": "capacity_exceeded", "message": "Execution capacity is full; retry later."}}
+        try:
+            created = self.store.create(task=task, executor=executor, cwd=str(cwd), timeout=timeout,
+                                        context_files=context_files, metadata=metadata)
+            task_id = created["task_id"]
+            with self._lock:
+                self._controls[task_id] = ProcessControl()
+                self._completion_events[task_id] = threading.Event()
+            thread = threading.Thread(target=self._execute,
+                                      args=(task_id, cwd, timeout, invocation_factory, parse), daemon=True)
+            thread.start()
+        except Exception as exc:
+            self.slots.release()
+            if "task_id" in locals():
+                with self._lock:
+                    self._controls.pop(task_id, None)
+                    self._completion_events.pop(task_id, None)
+                try:
+                    self.store.update(task_id, status="failed", error=str(exc)[:1000])
+                except Exception:
+                    pass
+            return {"success": False, "error": {"code": "submit_failed", "message": str(exc)[:1000]}}
+        return {"task_id": task_id, "executor": executor, "status": created["status"], "resolved_cwd": str(cwd)}
+
+    def submit(self, *, task: str | None, goal: str | None = None, executor: str,
+               cwd: Path, timeout: int, context_files: list[str] | None = None,
+               acceptance_criteria: list[str] | None = None, verification_commands: list[str] | None = None,
+               commit_mode: str = "allowed", output_schema: dict[str, object] | None = None,
+               parse_structured_output: bool = True) -> dict[str, object]:
+        task, goal = (task or "").strip(), (goal or "").strip()
+        if not task and not goal:
             raise ValueError("delegate_task requires task or goal.")
         if commit_mode not in ALLOWED_COMMIT_MODES:
             raise ValueError(f"Unsupported commit_mode: {commit_mode}")
-
         chosen_executor, command = self._resolve_executor(executor)
-        created = self.store.create(
-            task=normalized_task or normalized_goal,
-            executor=chosen_executor,
-            cwd=str(cwd),
-            timeout=timeout,
-            context_files=context_files,
-            metadata={
-                "goal": normalized_goal or None,
-                "acceptance_criteria": acceptance_criteria or [],
-                "verification_commands": verification_commands or [],
-                "commit_mode": commit_mode,
-                "output_schema": output_schema or None,
-                "parse_structured_output": parse_structured_output,
-            },
-        )
-        cancel_event = threading.Event()
+        context_files = [str((cwd / p).resolve()) for p in (context_files or [])]
+        metadata = {"goal": goal or None, "acceptance_criteria": acceptance_criteria or [],
+                    "verification_commands": verification_commands or [], "commit_mode": commit_mode,
+                    "output_schema": output_schema or None, "parse_structured_output": parse_structured_output}
+        return self._submit(
+            task=task or goal, executor=chosen_executor, cwd=cwd, timeout=timeout,
+            context_files=context_files, metadata=metadata, parse=parse_structured_output,
+            invocation_factory=lambda: self._build_invocation(
+                executor_name=chosen_executor, command=command, task=task or None, goal=goal or None,
+                cwd=cwd, context_files=context_files, acceptance_criteria=acceptance_criteria or [],
+                verification_commands=verification_commands or [], commit_mode=commit_mode))
+
+    def submit_command(self, *, command: str, cwd: Path, timeout: int) -> dict[str, object]:
+        return self._submit(task=command, executor="shell", cwd=cwd, timeout=timeout,
+                            invocation_factory=lambda: Invocation(args=command, use_shell=True))
+
+    def get(self, task_id: str, *, cursor: str | None = None, max_bytes: int = LOG_READ_BYTES) -> dict[str, object]:
+        try:
+            meta = self.store.snapshot(task_id, cursor=cursor, max_bytes=max_bytes)
+        except (OSError, ValueError, TypeError) as exc:
+            meta = {"success": False, "task_id": task_id,
+                    "error": {"code": "task_read_failed", "message": str(exc)[:1000]}, "completed": False}
         with self._lock:
-            self._cancel_events[created["task_id"]] = cancel_event
-        thread = threading.Thread(
-            target=self._run_task,
-            args=(
-                created["task_id"],
-                chosen_executor,
-                command,
-                normalized_task or None,
-                normalized_goal or None,
-                cwd,
-                timeout,
-                cancel_event,
-                context_files or [],
-                acceptance_criteria or [],
-                verification_commands or [],
-                commit_mode,
-                output_schema or None,
-                parse_structured_output,
-            ),
-            daemon=True,
-        )
-        thread.start()
-        return {
-            "task_id": created["task_id"],
-            "executor": chosen_executor,
-            "status": created["status"],
-        }
-
-    def submit_command(
-        self,
-        *,
-        command: str,
-        cwd: Path,
-        timeout: int,
-    ) -> dict[str, object]:
-        cwd_error = _cwd_error(command, cwd)
-        if cwd_error:
-            return cwd_error
-        created = self.store.create(
-            task=command,
-            executor="shell",
-            cwd=str(cwd),
-            timeout=timeout,
-            context_files=[],
-        )
-        cancel_event, _ = self._register_task(created["task_id"])
-        thread = threading.Thread(
-            target=self._run_command_task,
-            args=(created["task_id"], command, cwd, timeout, cancel_event),
-            daemon=True,
-        )
-        thread.start()
-        return {
-            "task_id": created["task_id"],
-            "executor": "shell",
-            "status": created["status"],
-        }
-
-    def get(self, task_id: str) -> dict[str, object]:
-        meta = self.store.get(task_id)
-        meta["summary"] = self.store.read_summary(task_id)
-        meta["stdout_tail"] = self.store.read_stdout(task_id)[-4000:]
-        meta["stderr_tail"] = self.store.read_stderr(task_id)[-4000:]
-        meta["artifacts"] = []
-        meta["completed"] = meta["status"] in TERMINAL_TASK_STATUSES
+            failure = self._failures.get(task_id)
+            control = self._controls.get(task_id)
+        if failure:
+            meta.update(failure)
+            meta["completed"] = failure.get("status") in TERMINAL_TASK_STATUSES
+            meta["success"] = False
+        meta["control_available"] = control is not None
+        if control:
+            with control.lock:
+                meta["cancel_requested"] = control.stop_reason == "cancelled"
+                meta["cleanup_failed"] = control.cleanup_failed
+                meta["dropped_bytes"] = control.dropped_bytes
+                meta["output_truncated"] = control.dropped_bytes > 0
+        meta.setdefault("output_truncated", False)
+        meta.setdefault("dropped_bytes", 0)
         return meta
 
-    def wait(self, task_id: str, timeout: float, poll_interval: float = 0.5) -> dict[str, object]:
-        """Block until the task reaches a terminal status or ``timeout`` elapses.
-
-        Event-driven when the task was submitted through this registry instance
-        (uses :class:`threading.Event` so there is no wakeup latency). For tasks
-        loaded from disk after a server restart the completion event is not
-        registered, so we fall back to polling ``meta['completed']`` at
-        ``poll_interval`` seconds until the deadline.
-        """
-        # Fast path: already finished.
-        meta = self.get(task_id)
-        if meta["completed"]:
-            meta["timed_out"] = False
-            return meta
-
-        with self._lock:
-            completion_event = self._completion_events.get(task_id)
-
-        remaining = max(float(timeout), 0.0)
-        if completion_event is not None:
-            # Event-driven wait: returns as soon as the worker thread marks
-            # completion, or after ``remaining`` seconds, whichever comes first.
-            completion_event.wait(timeout=remaining)
-            meta = self.get(task_id)
-            meta["timed_out"] = not meta["completed"]
-            return meta
-
-        # Fallback: no registered event (task persisted from a previous run).
-        deadline = time.monotonic() + remaining
-        interval = max(float(poll_interval), 0.05)
+    def wait(self, task_id: str, timeout: float, poll_interval: float = 0.5, *,
+             cursor: str | None = None, max_bytes: int = LOG_READ_BYTES,
+             return_on_output: bool = False) -> dict[str, object]:
+        try:
+            validate_seconds(timeout, maximum=MAX_WAIT_SECONDS, allow_zero=True)
+            validate_seconds(poll_interval)
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "error": {"code": "invalid_arguments", "message": str(exc)}}
+        deadline = time.monotonic() + timeout
+        # Capture a starting position so existing tail output doesn't wake an output wait.
+        if return_on_output and cursor is None:
+            cursor = self.get(task_id, max_bytes=max_bytes).get("next_cursor")
         while True:
-            meta = self.get(task_id)
-            if meta["completed"]:
-                meta["timed_out"] = False
+            with self._changed:
+                generation = self._generation
+            meta = self.get(task_id, cursor=cursor, max_bytes=max_bytes)
+            output = bool(meta.get("stdout") or meta.get("stderr"))
+            done = bool(meta.get("completed"))
+            if done or meta.get("success") is False or meta.get("cleanup_failed") or (return_on_output and output):
+                meta["wait_timed_out"] = False
+                meta["timed_out"] = False  # legacy wait meaning, never persisted
                 return meta
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                meta["wait_timed_out"] = True
                 meta["timed_out"] = True
                 return meta
-            time.sleep(interval)
+            with self._changed:
+                if generation == self._generation:
+                    self._changed.wait(min(remaining, max(0.05, poll_interval)))
 
     def cancel(self, task_id: str) -> dict[str, object]:
+        meta = self.get(task_id)
+        if meta.get("completed") or meta.get("success") is False:
+            return {**meta, "cancelled": meta.get("status") == "cancelled"}
         with self._lock:
-            cancel_event = self._cancel_events.get(task_id)
-            process = self._processes.get(task_id)
-        if cancel_event is not None:
-            cancel_event.set()
-        if process is not None and process.poll() is None:
-            process.kill()
-        updated = self.store.update(task_id, status="cancelled")
-        self._mark_completed(task_id)
-        return {
-            "task_id": task_id,
-            "status": updated["status"],
-            "cancelled": True,
-        }
+            control = self._controls.get(task_id)
+        if control is None:
+            return {**meta, "success": False, "cancelled": False,
+                    "error": {"code": "control_unavailable", "message": "This process does not own the active task; it was not cancelled."}}
+        accepted = control.request_stop("cancelled")
+        self._notify()
+        # Bounded acknowledgement: do not report cancellation until cleanup is confirmed.
+        result = self.wait(task_id, timeout=min(5.0, MAX_WAIT_SECONDS))
+        return {**result, "cancel_requested": accepted, "cancelled": result.get("status") == "cancelled"}
 
     def _resolve_executor(self, executor: str) -> tuple[str, str]:
-        if executor == "codex":
-            if not _command_available(self.codex_command):
-                raise RuntimeError("Codex command is not available.")
-            return "codex", self.codex_command or ""
-        if executor == "claude-code":
-            if not _command_available(self.claude_command):
-                raise RuntimeError("Claude Code command is not available.")
-            return "claude-code", self.claude_command or ""
-        if _command_available(self.codex_command):
-            return "codex", self.codex_command or ""
-        if _command_available(self.claude_command):
-            return "claude-code", self.claude_command or ""
-        raise RuntimeError("No delegate executor command is available.")
+        if executor not in {"auto", "codex", "claude-code"}:
+            raise ValueError(f"Unsupported executor: {executor}")
+        for name, command in (("codex", self.codex_command), ("claude-code", self.claude_command)):
+            if executor in ("auto", name) and _command_available(command):
+                return name, command or ""
+        raise RuntimeError("Requested delegate executor command is not available.")
 
-    def _run_task(
-        self,
-        task_id: str,
-        executor_name: str,
-        command: str,
-        task: str | None,
-        goal: str | None,
-        cwd: Path,
-        timeout: int,
-        cancel_event: threading.Event,
-        context_files: list[str],
-        acceptance_criteria: list[str],
-        verification_commands: list[str],
-        commit_mode: str,
-        output_schema: dict[str, object] | None,
-        parse_structured_output: bool,
-    ) -> None:
-        try:
-            self._run_task_impl(
-                task_id,
-                executor_name,
-                command,
-                task,
-                goal,
-                cwd,
-                timeout,
-                cancel_event,
-                context_files,
-                acceptance_criteria,
-                verification_commands,
-                commit_mode,
-                output_schema,
-                parse_structured_output,
-            )
-        finally:
-            self._mark_completed(task_id)
-
-    def _run_task_impl(
-        self,
-        task_id: str,
-        executor_name: str,
-        command: str,
-        task: str | None,
-        goal: str | None,
-        cwd: Path,
-        timeout: int,
-        cancel_event: threading.Event,
-        context_files: list[str],
-        acceptance_criteria: list[str],
-        verification_commands: list[str],
-        commit_mode: str,
-        output_schema: dict[str, object] | None,
-        parse_structured_output: bool,
-    ) -> None:
-        if cancel_event.is_set():
-            self.store.update(task_id, status="cancelled")
-            return
-
-        self.store.update(task_id, status="running")
-        invocation = self._build_invocation(
-            executor_name=executor_name,
-            command=command,
-            task=task,
-            goal=goal,
-            cwd=cwd,
-            context_files=context_files,
-            acceptance_criteria=acceptance_criteria,
-            verification_commands=verification_commands,
-            commit_mode=commit_mode,
-        )
-        process = subprocess.Popen(
-            invocation.args,
-            cwd=str(cwd),
-            shell=invocation.use_shell,
-            text=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+    def _execute(self, task_id: str, cwd: Path, timeout: float, invocation_factory, parse: bool) -> None:
         with self._lock:
-            self._processes[task_id] = process
-
-        if cancel_event.is_set() and process.poll() is None:
-            process.kill()
-
+            control = self._controls[task_id]
+        def output(stream, data):
+            self.store.append_log(task_id, stream, data)
+            self._notify()
+        def cleanup_error(message):
+            try:
+                self._persist(task_id, cleanup_failed=True, error=message)
+            except Exception:
+                pass
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout, stderr = process.communicate()
-            stdout = _decode_output(stdout)
-            stderr = _decode_output(stderr)
-            self.store.write_logs(task_id, stdout=stdout, stderr=stderr)
-            self.store.write_summary(task_id, _summarize(stdout, stderr))
-            self.store.update(task_id, status="failed", timed_out=True)
-            return
+            self._persist(task_id, status="running")
+            invocation = invocation_factory()
+            result = run_process(args=invocation.args, shell=invocation.use_shell, cwd=cwd, timeout=timeout,
+                                 control=control, output_limit=self.log_limit, on_output=output,
+                                 on_cleanup_failed=cleanup_error)
+            snapshot = self.store.snapshot(task_id)
+            summary = _summarize(str(snapshot["stdout_tail"]), str(snapshot["stderr_tail"]))[:1000]
+            self.store.write_summary(task_id, summary)
+            structured = None
+            parse_status = "disabled" if not parse else "skipped_truncated" if result.get("output_truncated") else "skipped_size_limit"
+            if parse and not result.get("output_truncated"):
+                # Only bounded output is eligible for best-effort JSON parsing.
+                small = self.store.snapshot(task_id, cursor="start")
+                if not small["has_more"]:
+                    structured = _extract_structured_output(small["stdout"])
+                    if structured is None:
+                        structured = _extract_structured_output(small["stderr"])
+                    parse_status = "parsed" if structured is not None else "not_parsed"
+            self._persist(task_id, **result, timed_out=result["execution_timed_out"], structured_output=structured,
+                          structured_output_status=parse_status, schema_validation="not_performed")
+        except Exception as exc:
+            logging.exception("Task %s failed", task_id)
+            result = {"status": "failed", "error": str(exc)[:1000]}
+            try:
+                self._persist(task_id, **result)
+            except Exception:
+                with self._lock:
+                    self._failures[task_id] = {"task_id": task_id, **result, "persistence_error": str(exc)[:1000]}
         finally:
             with self._lock:
-                self._processes.pop(task_id, None)
-
-        stdout = _decode_output(stdout)
-        stderr = _decode_output(stderr)
-        self.store.write_logs(task_id, stdout=stdout, stderr=stderr)
-        self.store.write_summary(task_id, _summarize(stdout, stderr))
-
-        structured_output = None
-        if parse_structured_output:
-            structured_output = _extract_structured_output(stdout) or _extract_structured_output(stderr)
-
-        if cancel_event.is_set() or self.store.get(task_id)["status"] == "cancelled":
-            self.store.update(task_id, status="cancelled")
-            return
-
-        status = "succeeded" if process.returncode == 0 else "failed"
-        self.store.update(
-            task_id,
-            status=status,
-            exit_code=process.returncode,
-            structured_output=structured_output,
-            output_schema=output_schema or None,
-        )
-
-    def _run_command_task(
-        self,
-        task_id: str,
-        command: str,
-        cwd: Path,
-        timeout: int,
-        cancel_event: threading.Event,
-    ) -> None:
-        try:
-            self._run_command_task_impl(task_id, command, cwd, timeout, cancel_event)
-        finally:
-            self._mark_completed(task_id)
-
-    def _run_command_task_impl(
-        self,
-        task_id: str,
-        command: str,
-        cwd: Path,
-        timeout: int,
-        cancel_event: threading.Event,
-    ) -> None:
-        if cancel_event.is_set():
-            self.store.update(task_id, status="cancelled")
-            return
-
-        self.store.update(task_id, status="running")
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(cwd),
-                shell=True,
-                text=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except OSError as exc:
-            self.store.write_logs(task_id, stdout="", stderr=str(exc))
-            self.store.write_summary(task_id, str(exc))
-            self.store.update(task_id, status="failed")
-            return
-        with self._lock:
-            self._processes[task_id] = process
-
-        if cancel_event.is_set() and process.poll() is None:
-            process.kill()
-
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout, stderr = process.communicate()
-            stdout = _decode_output(stdout)
-            stderr = _decode_output(stderr)
-            self.store.write_logs(task_id, stdout=stdout, stderr=stderr)
-            self.store.write_summary(task_id, _summarize(stdout, stderr))
-            self.store.update(task_id, status="failed", timed_out=True)
-            return
-        finally:
-            with self._lock:
-                self._processes.pop(task_id, None)
-
-        stdout = _decode_output(stdout)
-        stderr = _decode_output(stderr)
-        self.store.write_logs(task_id, stdout=stdout, stderr=stderr)
-        self.store.write_summary(task_id, _summarize(stdout, stderr))
-        structured_output = _extract_structured_output(stdout) or _extract_structured_output(stderr)
-
-        if cancel_event.is_set() or self.store.get(task_id)["status"] == "cancelled":
-            self.store.update(task_id, status="cancelled")
-            return
-
-        status = "succeeded" if process.returncode == 0 else "failed"
-        self.store.update(task_id, status=status, exit_code=process.returncode, structured_output=structured_output)
+                event = self._completion_events.pop(task_id, None)
+                if event:
+                    event.set()
+                self._controls.pop(task_id, None)
+            self.slots.release()
+            self._notify()
 
     def _build_invocation(
         self,

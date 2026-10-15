@@ -4,6 +4,8 @@ import contextlib
 import socket
 import threading
 import time
+import shlex
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -79,11 +81,14 @@ def _running_server(
 
 @asynccontextmanager
 async def _mcp_session(url: str, *, token: str):
+    from notion_local_ops_mcp.server import MCP_INSTRUCTIONS
+
     headers = {"Authorization": f"Bearer {token}"}
     async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
         async with streamable_http_client(url, http_client=client) as (read_stream, write_stream, _):
             async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
+                initialized = await session.initialize()
+                assert initialized.instructions == MCP_INSTRUCTIONS
                 yield session
 
 
@@ -92,6 +97,60 @@ async def _call_tool(session: ClientSession, name: str, arguments: dict[str, obj
     assert result.isError is False, result
     assert result.structuredContent is not None
     return result.structuredContent
+
+
+def test_tool_write_requires_valid_authentication(tmp_path: Path, monkeypatch) -> None:
+    token = "phase1-auth-test"
+    target = tmp_path / "auth-check.txt"
+    arguments = {"path": str(target), "content": "authorized", "cwd": str(tmp_path)}
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+        async def scenario():
+            async with httpx.AsyncClient(timeout=5) as client:
+                for authorization in (None, "Bearer wrong-token"):
+                    headers = {"Accept": "application/json, text/event-stream"}
+                    if authorization:
+                        headers["Authorization"] = authorization
+                    response = await client.post(url, headers=headers, json={
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "write_file", "arguments": arguments},
+                    })
+                    assert response.status_code == 401
+                    assert not target.exists()
+            async with _mcp_session(url, token=token) as session:
+                result = await _call_tool(session, "write_file", arguments)
+                assert result["success"]
+                assert target.read_text() == "authorized"
+        anyio.run(scenario)
+
+
+def test_phase1_project_edit_stream_and_cancel_through_mcp(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    token = "phase1-test-token"
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+        async def scenario():
+            async with _mcp_session(url, token=token) as client:
+                write = await _call_tool(client, "write_file", {"path": "code.txt", "content": "x" * 33000 + "\nEND", "cwd": str(project)})
+                assert write["resolved_cwd"] == str(project)
+                page = await _call_tool(client, "read_text", {"path": "code.txt", "cwd": str(project)})
+                assert page["partial_line"] and page["next_offset"] is None
+                rest = await _call_tool(client, "read_text", {"path": "code.txt", "cwd": str(project), "cursor": page["next_cursor"]})
+                assert (page["content"] + page["separator_after"] + rest["content"]).endswith("\nEND")
+                code = "import time; print('STARTED', flush=True); time.sleep(20)"
+                cmd = "exec " + shlex.quote(sys.executable) + " -c " + shlex.quote(code)
+                queued = await _call_tool(client, "run_command_stream", {"command": cmd, "cwd": str(project), "timeout": 25})
+                task = queued["task_id"]
+                try:
+                    running = await _call_tool(client, "wait_task", {"task_id": task, "timeout": 3, "cursor": "start", "return_on_output": True})
+                    assert "STARTED" in running["stdout"] and not running["completed"]
+                finally:
+                    cancelled = await _call_tool(client, "cancel_task", {"task_id": task})
+                assert cancelled["cancelled"] and cancelled["completed"]
+                again = await _call_tool(client, "cancel_task", {"task_id": task})
+                assert again["status"] == "cancelled"
+                invalid = await _call_tool(client, "get_task", {"task_id": "../invalid"})
+                assert invalid["success"] is False
+        anyio.run(scenario)
 
 
 def test_mcp_run_command_stream_end_to_end(tmp_path: Path, monkeypatch) -> None:

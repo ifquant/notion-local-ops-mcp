@@ -10,6 +10,8 @@ from notion_local_ops_mcp.tasks import TaskStore
 def _force_old_updated_at(store: TaskStore, task_id: str) -> None:
     meta_path = store._task_dir(task_id) / "meta.json"  # noqa: SLF001 - test helper
     payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    payload["status"] = "succeeded"
+    payload["finished_at"] = "2000-01-01T00:00:00+00:00"
     payload["updated_at"] = "2000-01-01T00:00:00+00:00"
     meta_path.write_text(json.dumps(payload), encoding="utf-8")
 

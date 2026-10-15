@@ -67,7 +67,7 @@ Working style:
 Tool strategy:
 - list_skills: use when the user asks what skills are available in this repo or globally.
 - server_info: call first when troubleshooting connection/runtime mismatches.
-- set_default_cwd / get_default_cwd: set once for repeated repo operations instead of passing cwd every time.
+- Pass explicit cwd for every project operation, including files/search/patch/skills/Shell/Git. set_default_cwd / get_default_cwd are legacy PROCESS-WIDE state shared by all clients; file tools without cwd still use WORKSPACE_ROOT.
 - In coding tasks, search the local repo first. Do not default to searching the Notion workspace.
 - apply_patch: 现有文件默认优先用它编辑，包括小改动、多 hunk 改动、移动、删除或一次 patch 里新增文件。每个 @@ hunk 都必须至少包含一行 '+' 或 '-'，并且必须在文件里唯一匹配。需要预检或预览时再用 dry_run=true / validate_only=true / return_diff=true。
 - write_file: create new files or rewrite short files when that is simpler than patching; use dry_run=true for no-write preview.
@@ -86,14 +86,23 @@ Execution rules:
 - When exploring a codebase, prefer search(mode='glob' or 'regex') over broad list_files calls.
 - Follow the loop: probe, edit, verify, summarize.
 - Do the minimum necessary read/explore work before editing.
-- After each edit, re-read the changed section or run a minimal verification command when useful.
+- Before editing, inspect the project baseline and preserve unrelated changes. After editing, re-read changed sections, inspect the diff, and run relevant verification.
 - Prefer apply_patch for edits to existing files; reserve write_file for new files or full rewrites.
 - Do not issue parallel writes to the same file.
-- After a logically meaningful change, inspect git_status and git_diff, then create a small focused commit instead of waiting until the end.
+- After a logically meaningful change, inspect git_status and git_diff. Commit only when the user or applicable repository rules authorize it; do not automatically commit during acceptance testing.
 - Use focused commits. Do not mix unrelated changes in one commit.
 - Use clear commit messages, preferably conventional commit style such as fix, feat, docs, test, refactor, or chore.
 - For destructive actions such as deleting files, resetting changes, or dangerous shell commands, ask first.
 - If a command or delegated task fails, summarize the root cause and adjust the approach instead of retrying blindly.
+
+Reliability rules:
+- Follow next_cursor and deferred reads; partial content is not the whole file. On file_changed, re-read before continuing.
+- On wait_timed_out, keep the same task_id and continue querying; never restart the command just because waiting timed out.
+- If a submission response is lost, the outcome is unknown. Do not blindly resubmit side-effecting commands; first reconcile available records or ask for help.
+- On capacity_exceeded, retry later without busy polling. On partial write failure, re-read affected files and inspect the diff before repair; do not replay the entire patch.
+- cancel_requested is not confirmed termination. On cleanup_failed or control_unavailable, report uncertainty and stop steps that depend on the process having exited.
+- Even after completed=true, continue reading while has_more=true. Disclose output truncation; never treat missing logs as proof of success.
+- Report completion only when the requested change and its verification both succeed. Do not repeat unchanged failing commands. First-stage Notion acceptance uses direct tools, not delegate_task.
 
 Verification rules:
 - After code changes, prefer this minimum verification ladder when applicable:
@@ -363,7 +372,7 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 - `write_file`：整文件写入，支持 `dry_run`
 - `apply_patch`：现有文件的默认编辑工具；使用 `*** Begin Patch` / `*** Update File` 文本语法，拒绝纯 context hunk，要求唯一 context 匹配，并返回每文件改动统计/警告
 - `server_info`：查看运行时配置与已注册工具清单
-- `set_default_cwd`：设置会话级默认工作目录
+- `set_default_cwd`：设置进程级共享的 Shell/Git 默认目录；多对话请显式传 `cwd`
 - `get_default_cwd`：查看当前会话/生效工作目录
 - `git_status`：结构化仓库状态（仅在 cwd 位于 git 仓库内时使用）
 - `git_diff`：按文件分组的结构化 diff（含每文件独立截断）
@@ -402,6 +411,56 @@ NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING=1 ./scripts/dev-tunnel.sh
 - 响应状态码与耗时
 
 ## 验证
+
+### 第一阶段：可靠的本地 coding 工具
+
+每个项目操作都显式传 `cwd`。相对 `cwd` 以 `WORKSPACE_ROOT` 为基准；相对文件路径以本次 `cwd` 为基准；绝对文件路径保持其目标。省略 `cwd` 的旧文件调用仍使用 `WORKSPACE_ROOT`，旧 Shell/Git 调用仍使用进程级默认目录。全局默认目录和 relay 绑定尚未按对话隔离。
+
+以下是工具调用的 JSON 参数示例，替换项目路径和服务返回的 ID/cursor 后使用：
+
+`read_text`：
+
+```json
+{"cwd":"/absolute/path/to/project","path":"src/app.py","start_line":1,"line_limit":200}
+```
+
+续读优先使用返回的 `next_cursor`，不再同时传 `start_line`：
+
+```json
+{"cwd":"/absolute/path/to/project","path":"src/app.py","cursor":"<next_cursor>"}
+```
+
+`partial_line=true` 表示超长行尚未读完，此时 `next_offset` 为空，必须使用 cursor。文件变化返回 `file_changed`，需要重新读取。文本统一换行为 LF，展示内容省略末尾换行；精确拼接分页文本时使用 `content + separator_after`（关闭行号）。无效 UTF-8 被拒绝。批量读取中的 `deferred` 文件未被读取，可按返回路径和 `next_start_line` 单独继续。
+
+`write_file` / `apply_patch` 同样接受 `cwd`：
+
+```json
+{"cwd":"/absolute/path/to/project","path":"notes.txt","content":"verified\n","dry_run":true}
+```
+
+`run_command_stream`：
+
+```json
+{"cwd":"/absolute/path/to/project","command":"python3 -u -c \"import time; print('STARTED'); time.sleep(3); print('DONE')\"","timeout":20}
+```
+
+用 `wait_task` 读取中间输出；`cursor="start"` 从已保存日志的开头开始，后续换成返回的 `next_cursor`：
+
+```json
+{"task_id":"<task_id>","cursor":"start","return_on_output":true,"timeout":10,"max_bytes":32768}
+```
+
+`get_task` 接受相同的 `cursor` / `max_bytes`，不等待。省略 cursor 保留旧的输出尾部查询。stdout/stderr 分别保证顺序，不承诺两者之间的精确时序。`has_more` 表示还有已保存的日志，任务 `completed=true` 后也可能需要继续读取。
+
+`wait_timed_out` 只说明这次等待结束，不取消任务；`execution_timed_out` 才表示命令超过执行时限。旧 `timed_out` 在 `wait_task` 中仍表示等待超时，在 `get_task` 中保留执行超时含义；新调用请使用两个明确字段。单次等待最大 30 秒，长任务需要分次等待。
+
+`cancel_task` 参数为 `{"task_id":"<task_id>"}`。收到 `cancel_requested` 不代表已停止；确认 `cancelled=true` 和 `completed=true`。取消会处理同一受管理进程组，先 TERM 再 KILL；已完成任务保持原结果。无法确认清理时返回 `cleanup_failed`，任务仍占用执行额度；旧服务进程的活动记录返回 `control_unavailable`。本阶段不接管跨重启任务，不支持交互输入/PTY或自行脱离进程组的后台服务；非 POSIX 平台明确拒绝受管理执行。
+
+默认上限：单次文件文本 32 KiB、最多 2,000 行，批量最多 16 文件/64 KiB；任务查询 32 KiB、每任务保存 16 MiB 日志；同一进程最多 4 个执行。配置见 `.env.example`，实际值由 `server_info.limits` 返回。日志达到保留上限后继续消费管道并丢弃后续超额文本，`output_truncated` / `dropped_bytes` 会明确报告；不要据此声称日志完整。同步命令输出也有 32 KiB 上限。任务提交元数据和同步命令限制为 64 KiB，较大的上下文请放入文件。
+
+清理仅删除超过保留时间的终态任务；活跃、损坏和链接目录会跳过。文件/多文件补丁不是事务：失败可能已产生部分修改，请检查 `applied_files`、`failed_file`、`not_applied_files`、`requires_reread` 等字段并重新读取，不能直接整批重试。
+
+实现计划和分层验收见 [三阶段计划](docs/notion-code-agent-plan.zh-CN.md) 与 [第一阶段验收记录](docs/phase1-verification.zh-CN.md)。
 
 ```bash
 source .venv/bin/activate

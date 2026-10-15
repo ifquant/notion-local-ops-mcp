@@ -237,59 +237,17 @@ def test_build_invocation_resolves_windows_delegate_shim(
 
 
 def test_run_task_decodes_utf8_process_output(tmp_path: Path, monkeypatch) -> None:
+    import shlex
+    import sys
     store = TaskStore(tmp_path / "state")
-    registry = ExecutorRegistry(
-        store=store,
-        codex_command="codex",
-        claude_command="claude",
-    )
-    task = store.create(task="Run codex", executor="codex", cwd=str(tmp_path), timeout=5)
-
-    monkeypatch.setattr(
-        registry,
-        "_build_invocation",
-        lambda **_: Invocation(args=["codex"], use_shell=False),
-    )
-
-    popen_kwargs: dict[str, object] = {}
-
-    class FakeProcess:
-        def __init__(self, *args, **kwargs) -> None:
-            popen_kwargs.update(kwargs)
-            self.returncode = 0
-
-        def poll(self):
-            return None
-
-        def communicate(self, timeout=None):
-            return (b"done \xe2\x98\x83\xff", b"warn \xff")
-
-        def kill(self) -> None:
-            return None
-
-    monkeypatch.setattr(executors.subprocess, "Popen", FakeProcess)
-
-    registry._run_task(
-        task_id=task["task_id"],
-        executor_name="codex",
-        command="codex",
-        task="Run codex",
-        goal=None,
-        cwd=tmp_path,
-        timeout=5,
-        cancel_event=executors.threading.Event(),
-        context_files=[],
-        acceptance_criteria=[],
-        verification_commands=[],
-        commit_mode="allowed",
-        output_schema=None,
-        parse_structured_output=True,
-    )
-
-    assert popen_kwargs["text"] is False
-    assert store.get(task["task_id"])["status"] == "succeeded"
-    assert store.read_stdout(task["task_id"]) == "done \u2603\ufffd"
-    assert store.read_stderr(task["task_id"]) == "warn \ufffd"
+    code = "import os; os.write(1, bytes([100,111,110,101,32,226,152,131,255])); os.write(2, bytes([119,97,114,110,32,255]))"
+    registry = ExecutorRegistry(store=store,
+        codex_command=shlex.quote(sys.executable) + " -c " + shlex.quote(code), claude_command=None)
+    task = registry.submit(task="emit bytes", executor="codex", cwd=tmp_path, timeout=5)
+    result = registry.wait(task["task_id"], timeout=5)
+    assert result["status"] == "succeeded"
+    assert store.read_stdout(task["task_id"]) == "done ☃�"
+    assert store.read_stderr(task["task_id"]) == "warn �"
 
 
 def test_delegate_task_extracts_structured_json_output(tmp_path: Path) -> None:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import fnmatch
 from pathlib import Path
 
+from .workspaces import current_scope
+
 
 def _read_skill_summary(path: Path) -> dict[str, str]:
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -89,7 +91,13 @@ def list_skills(
         if not exists:
             continue
 
+        run_scope = current_scope.get()
+        if scope == "project" and run_scope and not root.resolve().is_relative_to(run_scope.root):
+            continue
+
         for skill_file in sorted(root.rglob("SKILL.md"), key=lambda item: str(item)):
+            if scope == "project" and run_scope and not skill_file.resolve().is_relative_to(run_scope.root):
+                continue
             summary = _read_skill_summary(skill_file)
             if name_pattern is not None and not fnmatch.fnmatchcase(
                 summary["name"], name_pattern

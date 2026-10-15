@@ -67,7 +67,7 @@ Working style:
 Tool strategy:
 - list_skills: use when the user asks what skills are available in this repo or globally.
 - server_info: call first when troubleshooting connection/runtime mismatches.
-- Pass explicit cwd for every project operation, including files/search/patch/skills/Shell/Git. set_default_cwd / get_default_cwd are legacy PROCESS-WIDE state shared by all clients; file tools without cwd still use WORKSPACE_ROOT.
+- For scoped work: open_workspace, then start_run with a stable creation_key; pass run_id to project tools. get_run currently restores identity only. Without run_id, pass explicit cwd; set_default_cwd remains shared PROCESS-WIDE state.
 - In coding tasks, search the local repo first. Do not default to searching the Notion workspace.
 - apply_patch: 现有文件默认优先用它编辑，包括小改动、多 hunk 改动、移动、删除或一次 patch 里新增文件。每个 @@ hunk 都必须至少包含一行 '+' 或 '-'，并且必须在文件里唯一匹配。需要预检或预览时再用 dry_run=true / validate_only=true / return_diff=true。
 - write_file: create new files or rewrite short files when that is simpler than patching; use dry_run=true for no-write preview.
@@ -365,6 +365,7 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 
 ## MCP 工具
 
+- `open_workspace` / `start_run` / `get_run`：持久化项目与工作身份，约定见下方第二阶段 2A
 - `list_files`：列出文件和目录并支持分页；默认排除隐藏/噪声目录并尊重 `.gitignore`
 - `list_skills`：发现项目级和全局 skills，并返回名称与简介
 - `search`：统一查询入口（glob 路径搜索 / regex 搜索 / literal 子串搜索）；默认排除隐藏项和 `.gitignore` 命中的路径，并支持对单文件直接做 regex/text 搜索
@@ -411,6 +412,20 @@ NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING=1 ./scripts/dev-tunnel.sh
 - 响应状态码与耗时
 
 ## 验证
+
+### 第二阶段 2A：稳定的工作身份
+
+1. 调用 `open_workspace`，参数 `{"path":"/absolute/path/to/project"}`，登记已有目录。路径别名归一，不把不同 worktree 合并。
+2. 调用 `start_run`，参数 `{"workspace_id":"<id>","goal":"修复解析器","acceptance_criteria":["解析器测试通过"],"creation_key":"parser-fix-1"}`。相同创建键和参数返回原 run，参数改变则冲突。这只是**创建工作去重，不是执行任务去重**。
+3. 文件、搜索、补丁、项目技能、Shell 和 Git 操作传 `run_id`。省略 cwd 时使用登记的项目根目录；相对 cwd 从该根目录解析。项目外路径、补丁移动目标及符号链接越界被拒绝。`include_global` 仍可列出全局技能；其位置只是全局摘要，不属于该项目的文件目标。
+4. 后台命令和委派任务先保存 run 关联再执行。`get_task` / `wait_task` / `cancel_task` 从 task_id 查归属；额外传入不匹配的 run_id 会被拒绝。旧任务保留为未关联（`run_id: null`），不凭 cwd 猜测所属工作。
+5. 断线或重启后，`get_run` 可读取身份、目标、验收条件及目录可用性。项目移动、消失或被替换时不自动重绑；即使项目消失仍可查任务，但重启不会恢复进程控制权。
+
+带 run 的 Git 操作要求仓库根目录位于项目内，路径只接受普通路径，不接受 Git pathspec magic。使用仓库级操作时应登记仓库根目录，而不是它的子目录。这些检查用于防止串项目，**不是安全沙箱**；Shell、委派程序、Git hook/config 和外部程序仍拥有服务账号的权限。
+
+新增存储为本地 `STATE_DIR/work/identity.sqlite3`，schema 版本 1，目录 0700、数据库 0600。SQLite 每次争用锁最多等待 2 秒，返回 `store_busy` 后稍后重试。run 输入上限 64 KiB，创建键上限 128 UTF-8 字节，数据库上限 64 MiB。磁盘/存储错误停止相关写入，不清库重建。状态目录应放本地文件系统；原任务 JSON/日志仍是执行结果的权威来源，不迁移日志或复制终态。
+
+2A **尚不包含** checkpoint、工作/任务列表、任务提交去重、编辑版本保护或进程接管。带 run 的调用暂不发送到旧的全局 relay 绑定，按工作隔离的 relay 路由在 2E 实现；未关联调用保留原行为。使用前可查 `server_info.work_identity` 的能力标记。
 
 ### 第一阶段：可靠的本地 coding 工具
 

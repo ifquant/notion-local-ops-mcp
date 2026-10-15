@@ -129,7 +129,7 @@ Working style:
 Tool strategy:
 - list_skills: use when the user asks what skills are available in this repo or globally.
 - server_info: call first when troubleshooting connection/runtime mismatches.
-- Pass explicit cwd for every project operation, including files/search/patch/skills/Shell/Git. set_default_cwd / get_default_cwd are legacy PROCESS-WIDE state shared by all clients; file tools without cwd still use WORKSPACE_ROOT.
+- For scoped work: open_workspace, then start_run with a stable creation_key; pass run_id to project tools. get_run currently restores identity only. Without run_id, pass explicit cwd; set_default_cwd remains shared PROCESS-WIDE state.
 - In coding tasks, search the local repo first. Do not default to searching the Notion workspace.
 - apply_patch: use this as the default edit tool for existing files, including small edits, multi-hunk edits, moves, deletes, or adds in one patch. Each @@ hunk must include at least one '+' or '-' line and must match exactly one location in the file. Use dry_run=true, validate_only=true, or return_diff=true when you want validation or a preview before writing.
 - write_file: create new files or rewrite short files when that is simpler than patching; use dry_run=true for no-write preview.
@@ -435,6 +435,7 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 
 ## MCP Tools
 
+- `open_workspace` / `start_run` / `get_run`: durable project/work identity; see the phase 2A contract below
 - `list_files`: list files and directories with pagination; excludes hidden/junk dirs and respects `.gitignore` by default
 - `list_skills`: discover project and global skills with name and description summaries
 - `search`: canonical query tool that unifies glob path search, regex grep, and literal substring search; excludes hidden and `.gitignore`d paths by default and supports regex/text search against a single file path
@@ -481,6 +482,20 @@ When enabled, the server log includes `MCP_DEBUG` lines with:
 - response status and duration
 
 ## Verify
+
+### Phase 2A work identity
+
+1. Call `open_workspace` with `{"path":"/absolute/path/to/project"}` to register an existing directory. Aliases resolve to one workspace; separate worktree roots remain separate.
+2. Call `start_run` with `{"workspace_id":"<id>","goal":"Fix the parser","acceptance_criteria":["Parser tests pass"],"creation_key":"parser-fix-1"}`. Repeating the same creation request returns the same run; changed input with the same key conflicts. This is **run creation deduplication, not task submission deduplication**.
+3. Pass `run_id` to file/search/patch/project-skills/Shell/Git calls. Omitted `cwd` uses the registered root; relative `cwd` is anchored there. Paths outside the root, including patch move targets and symlink escapes, are rejected. Global skills remain available through `include_global`; their summary locations are not scoped project files.
+4. Background commands and delegated tasks persist their run association before execution. `get_task` / `wait_task` / `cancel_task` infer identity from task_id; an optional mismatched run_id is rejected. Old tasks stay unassociated (`run_id: null`), even if their cwd matches a project.
+5. `get_run` reads identity, goal, criteria and root availability after reconnect/restart. A missing or replaced root is not silently rebound. Task queries remain possible if the project disappears; restarting the service does not restore process control.
+
+Scoped Git calls require the repository root to lie inside the registered project, and accept plain paths rather than Git pathspec magic. Register the repository root instead of a subdirectory when using repository-wide Git operations. Scope checks prevent accidental project mixing, **not unauthorized access**: Shell/delegates, Git hooks/config and external programs still have the server account's permissions.
+
+New metadata lives in local `STATE_DIR/work/identity.sqlite3`, schema version 1, with a 0700 directory and 0600 database. SQLite write contention waits at most 2 seconds per lock acquisition; `store_busy` means retry later. Run input is capped at 64 KiB (creation key: 128 UTF-8 bytes); the database is capped at 64 MiB. Disk/storage errors stop affected writes, never reset records. Keep this state on a local filesystem. Existing task JSON/logs remain authoritative for execution; no log/status migration is performed.
+
+Phase 2A does **not** include checkpoints, run/task lists, task submission deduplication, edit-version protection or process takeover. Scoped calls intentionally do not fall back to the legacy global relay binding; scoped relay routing is deferred to 2E. Unscoped calls retain their existing behavior. Check `server_info.work_identity` for capability flags before assuming later phases are available.
 
 ### Phase 1 tool contracts
 

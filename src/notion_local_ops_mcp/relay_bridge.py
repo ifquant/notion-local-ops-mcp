@@ -30,6 +30,7 @@ from typing import Any
 
 from . import config, session
 from .instrument import ToolEvent
+from .workspaces import current_scope
 
 
 _dropped_lock = threading.Lock()
@@ -116,6 +117,9 @@ class RelayBridgeSink:
         return age_seconds > ttl_seconds
 
     def on_tool_event(self, event: ToolEvent) -> None:
+        # shortcut: scoped relay routing arrives in 2E; never send run work to the legacy binding.
+        if current_scope.get() is not None or event.tool in {"open_workspace", "start_run", "get_run"}:
+            return
         if not self._enabled():
             return
         binding = session.get_bound_run()

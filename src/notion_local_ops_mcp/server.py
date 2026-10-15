@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import os
 import re
+from functools import wraps
+from inspect import signature
+from pathlib import Path
 
 from fastmcp import FastMCP
 import uvicorn
@@ -69,6 +72,10 @@ from .search import grep_files as grep_files_impl
 from .shell import run_command as run_command_impl
 from .skills import list_skills as list_skills_impl
 from .tasks import TaskStore
+from .workspaces import (
+    LOCK_WAIT_SECONDS, RECORD_MAX_BYTES, SCHEMA_VERSION, STORE_MAX_BYTES,
+    RunScope, WorkError, current_scope,
+)
 
 
 # Bearer auth lives exclusively in the HTTP layer (http_compat.HTTPBearerAuthMiddleware)
@@ -83,7 +90,11 @@ registry = ExecutorRegistry(
 )
 
 MCP_INSTRUCTIONS = (
-    "Pass explicit cwd for every project operation; the legacy default cwd is process-wide. "
+    "For scoped work, open_workspace then start_run with a stable creation_key, and pass run_id to project tools. "
+    "get_run currently restores identity only, not checkpoints. Run identity is not a sandbox. "
+    "With run_id, omitted cwd uses its project root and relative cwd is anchored there. "
+    "Without run_id, pass explicit cwd for every project operation; the legacy default cwd is process-wide. "
+    "Phase 2A scoped calls are not sent to legacy relay bindings; scoped relay arrives separately. "
     "Use direct tools first for normal tasks. Prioritize apply_patch/write_file for edits and "
     "run_command_stream/wait_task for long-running shell work. "
     "Use search/read_text for focused repo discovery and reading, not as a substitute for every shell step. "
@@ -164,19 +175,90 @@ OPEN_WORLD_WRITE_TOOL = {
 }
 
 
+def scoped_tool(fn):
+    """Resolve explicit/durable identity once, without mutating shared session defaults."""
+    sig = signature(fn)
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        token = None
+        identity = None
+        try:
+            arguments = sig.bind(*args, **kwargs).arguments
+            run_id = arguments.get("run_id")
+            work = registry.store.work
+            if "task_id" in arguments:
+                identity = work.task_run(arguments["task_id"])
+                if run_id is not None and (identity is None or identity["run_id"] != run_id):
+                    raise WorkError("scope_conflict", "Task does not belong to the supplied run.")
+                if identity:
+                    run = work.get_run(identity["run_id"])
+                    # Query/cancel must remain usable even when the project has disappeared.
+                    scope = RunScope(run["run_id"], run["workspace_id"], Path(run["workspace"]["path"]))
+                    token = current_scope.set(scope)
+            elif run_id is not None:
+                scope = work.scope(run_id)
+                identity = {"run_id": scope.run_id, "workspace_id": scope.workspace_id}
+                token = current_scope.set(scope)
+            result = fn(*args, **kwargs)
+            if identity:
+                result = {**result, **identity}
+            elif "task_id" in arguments:
+                result = {**result, "run_id": None, "workspace_id": None}
+            return result
+        except WorkError as exc:
+            return exc.result()
+        finally:
+            if token is not None:
+                current_scope.reset(token)
+
+    return wrapped
+
+
+@mcp.tool(name="open_workspace", title="Open Workspace", annotations=LOCAL_STATE_TOOL,
+          description="Register an existing project directory and return stable workspace_id. Does not create directories or change global cwd. Identity is not a sandbox.")
+@traced("open_workspace")
+def open_workspace(path: str) -> dict[str, object]:
+    try:
+        return registry.store.work.open_workspace(resolve_path(path, WORKSPACE_ROOT))
+    except WorkError as exc:
+        return exc.result()
+
+
+@mcp.tool(name="start_run", title="Start Run", annotations=LOCAL_STATE_TOOL,
+          description="Create durable work identity in a workspace. Reuse creation_key on response loss; changed input with the same key conflicts. This does not execute tasks or provide task submission deduplication.")
+@traced("start_run")
+def start_run(workspace_id: str, goal: str, acceptance_criteria: list[str], creation_key: str) -> dict[str, object]:
+    try:
+        return registry.store.work.start_run(workspace_id, goal, acceptance_criteria, creation_key)
+    except WorkError as exc:
+        return exc.result()
+
+
+@mcp.tool(name="get_run", title="Get Run", annotations=READ_ONLY_TOOL,
+          description="Read durable run identity, goal, acceptance criteria and workspace availability. Phase 2A only: no checkpoint, Git baseline comparison, task list or process takeover yet.")
+@traced("get_run")
+def get_run(run_id: str) -> dict[str, object]:
+    try:
+        return registry.store.work.get_run(run_id)
+    except WorkError as exc:
+        return exc.result()
+
+
 @mcp.tool(
     name="list_skills",
     title="List Skills",
     annotations=READ_ONLY_TOOL,
     description=(
         "List project and global agent skills as lightweight summaries. "
-        "Pass cwd for project discovery; omitted cwd uses WORKSPACE_ROOT, not shared default cwd. "
+        "Pass run_id for scoped project discovery, or cwd for legacy discovery. Global skills remain an explicit include_global option. "
         "Returns skill name, description, preferred path, and source locations. "
         "Use namespace ('agents' | 'codex' | 'claude') to scope, name_pattern "
         "(fnmatch, e.g. 'git-*') to filter by skill name, and "
         "description_max_length to cap long descriptions for index-style scans."
     ),
 )
+@scoped_tool
 @traced("list_skills", result_fn=_read_result_summary)
 def list_skills(
     include_project: bool = True,
@@ -185,6 +267,7 @@ def list_skills(
     name_pattern: str | None = None,
     description_max_length: int | None = None,
     cwd: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     base = resolve_file_cwd(cwd, WORKSPACE_ROOT)
     result = list_skills_impl(
@@ -208,9 +291,10 @@ def list_skills(
         "paths are excluded by default. Set include_hidden=True or "
         "respect_gitignore=False to see them; add exclude_patterns for "
         "fnmatch-style patterns (matched against both name and relative path). "
-        "Pass cwd for relative paths; omitted cwd preserves WORKSPACE_ROOT."
+        "Pass run_id to anchor cwd/paths in its project; without run_id, omitted cwd preserves WORKSPACE_ROOT."
     ),
 )
+@scoped_tool
 @traced("list_files", result_fn=_read_result_summary)
 def list_files(
     path: str | None = None,
@@ -221,6 +305,7 @@ def list_files(
     respect_gitignore: bool = True,
     exclude_patterns: list[str] | None = None,
     cwd: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     if limit <= 0 or offset < 0:
         return {"success": False, "error": {"code": "invalid_arguments", "message": "limit must be positive; offset must be non-negative."}}
@@ -244,12 +329,13 @@ def list_files(
     annotations=READ_ONLY_TOOL,
     description=(
         "Canonical search tool that unifies glob, regex grep, and plain-text search. "
-        "Pass cwd for relative paths; omitted cwd preserves WORKSPACE_ROOT. "
+        "Pass run_id to anchor cwd/paths in its project; without run_id, omitted cwd preserves WORKSPACE_ROOT. "
         "Use mode='glob' for path discovery, mode='regex' for code/text regex, and "
         "mode='text' for literal substring search. Hidden entries and .gitignore'd "
         "paths are excluded by default; regex/text search also accept a single file path."
     ),
 )
+@scoped_tool
 @traced("search", result_fn=_read_result_summary)
 def search(
     mode: str = "regex",
@@ -268,6 +354,7 @@ def search(
     respect_gitignore: bool = True,
     exclude_patterns: list[str] | None = None,
     cwd: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     if limit <= 0 or offset < 0 or before < 0 or after < 0:
         return {"success": False, "error": {"code": "invalid_arguments", "message": "limit must be positive; offset/before/after must be non-negative."}}
@@ -351,10 +438,11 @@ def search(
         "Canonical text-reader tool. Pass either `path` for single-file reads or "
         "`paths` for batch reads. Pagination is line-based via start_line/line_limit. "
         "Prefer returned next_cursor to continue, especially for partial long lines; do not combine cursor and start_line. "
-        "Batch deferred entries must be read separately. Pass cwd for project-relative paths. "
+        "Batch deferred entries must be read separately. Pass run_id for scoped paths, or cwd for legacy project-relative paths. "
         "Set include_line_numbers=true for evidence. Invalid UTF-8 is rejected."
     ),
 )
+@scoped_tool
 @traced("read_text", result_fn=_read_result_summary)
 def read_text(
     path: str | None = None,
@@ -364,6 +452,7 @@ def read_text(
     include_line_numbers: bool = False,
     cwd: str | None = None,
     cursor: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     base = resolve_file_cwd(cwd, WORKSPACE_ROOT)
     has_path = bool(path)
@@ -416,10 +505,12 @@ def read_text(
     name="write_file",
     title="Write File",
     annotations=LOCAL_WRITE_TOOL,
-    description="Write full content to a file (supports dry_run). Pass cwd for project-relative paths; omitted cwd preserves WORKSPACE_ROOT. On write failure reread the target because partial writes are possible.",
+    description="Write full content to a file (supports dry_run). Pass run_id for scoped paths, or cwd for legacy paths. No edit-version protection yet. On write failure reread the target because partial writes are possible.",
 )
+@scoped_tool
 @traced("write_file", result_fn=_write_file_result_summary)
-def write_file(path: str, content: str, dry_run: bool = False, cwd: str | None = None) -> dict[str, object]:
+def write_file(path: str, content: str, dry_run: bool = False, cwd: str | None = None,
+               run_id: str | None = None) -> dict[str, object]:
     base = resolve_file_cwd(cwd, WORKSPACE_ROOT)
     target = resolve_path(path, base)
     return {**write_file_impl(target, content=content, dry_run=dry_run), "resolved_cwd": str(base)}
@@ -431,11 +522,12 @@ def write_file(path: str, content: str, dry_run: bool = False, cwd: str | None =
     annotations=LOCAL_WRITE_TOOL,
     description=(
         "Apply a structured patch using *** Begin Patch / *** Update File blocks. "
-        "Pass cwd for relative source and move-target paths. Multi-file writes are not atomic; inspect partial failure details. "
+        "Pass run_id to scope source and move-target paths, or cwd for legacy paths. Multi-file writes are not atomic; inspect partial failure details. "
         "Each @@ hunk must contain at least one '+' or '-' line and must "
         "match exactly one location in the target file; pure-context hunks are rejected."
     ),
 )
+@scoped_tool
 @traced(
     "apply_patch",
     args_fn=_patch_args_summary,
@@ -447,6 +539,7 @@ def apply_patch(
     validate_only: bool = False,
     return_diff: bool = False,
     cwd: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     base = resolve_file_cwd(cwd, WORKSPACE_ROOT)
     result = apply_patch_impl(
@@ -513,6 +606,19 @@ async def server_info() -> dict[str, object]:
             "LOG_READ_BYTES", "LOG_RETAIN_BYTES", "COMMAND_OUTPUT_BYTES", "MAX_EXECUTIONS",
             "MAX_WAIT_SECONDS", "TERM_GRACE_SECONDS", "KILL_GRACE_SECONDS")},
         "process_groups_supported": os.name == "posix",
+        "work_identity": {
+            "schema_version": SCHEMA_VERSION,
+            "run_scoped_paths": True,
+            "task_associations": True,
+            "checkpoint_recovery": False,
+            "submission_deduplication": False,
+            "edit_version_checks": False,
+            "scoped_relay": False,
+            "process_takeover": False,
+            "lock_wait_seconds": LOCK_WAIT_SECONDS,
+            "record_max_bytes": RECORD_MAX_BYTES,
+            "store_max_bytes": STORE_MAX_BYTES,
+        },
     }
 
 
@@ -593,8 +699,9 @@ def get_default_cwd() -> dict[str, object]:
     annotations=READ_ONLY_TOOL,
     description="Return structured git status for the repository at cwd or the current workspace root.",
 )
+@scoped_tool
 @traced("git_status", result_fn=_read_result_summary)
-def git_status(cwd: str | None = None) -> dict[str, object]:
+def git_status(cwd: str | None = None, run_id: str | None = None) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return git_status_impl(cwd=resolved_cwd)
 
@@ -609,6 +716,7 @@ def git_status(cwd: str | None = None) -> dict[str, object]:
         "file does not hide changes in other files."
     ),
 )
+@scoped_tool
 @traced("git_diff", result_fn=_read_result_summary)
 def git_diff(
     cwd: str | None = None,
@@ -616,6 +724,7 @@ def git_diff(
     paths: list[str] | None = None,
     max_bytes: int = 65536,
     per_file_max_bytes: int = 16384,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return git_diff_impl(
@@ -637,6 +746,7 @@ def git_diff(
         "sign_off (append Signed-off-by trailer), and dry_run preview."
     ),
 )
+@scoped_tool
 @traced("git_commit", result_fn=_git_commit_result_summary)
 def git_commit(
     message: str,
@@ -648,6 +758,7 @@ def git_commit(
     author: str | None = None,
     sign_off: bool = False,
     dry_run: bool = False,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return git_commit_impl(
@@ -669,8 +780,9 @@ def git_commit(
     annotations=READ_ONLY_TOOL,
     description="Return recent git commits for the repository at cwd.",
 )
+@scoped_tool
 @traced("git_log", result_fn=_read_result_summary)
-def git_log(cwd: str | None = None, limit: int = 10) -> dict[str, object]:
+def git_log(cwd: str | None = None, limit: int = 10, run_id: str | None = None) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return git_log_impl(cwd=resolved_cwd, limit=limit)
 
@@ -684,12 +796,14 @@ def git_log(cwd: str | None = None, limit: int = 10) -> dict[str, object]:
         "Useful for inspecting a specific commit without shelling out."
     ),
 )
+@scoped_tool
 @traced("git_show", result_fn=_read_result_summary)
 def git_show(
     ref: str = "HEAD",
     cwd: str | None = None,
     max_bytes: int = 65536,
     per_file_max_bytes: int = 16384,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return git_show_impl(
@@ -709,6 +823,7 @@ def git_show(
         "Restrict to a line range via start_line / end_line."
     ),
 )
+@scoped_tool
 @traced("git_blame", result_fn=_read_result_summary)
 def git_blame(
     path: str,
@@ -716,6 +831,7 @@ def git_blame(
     ref: str | None = None,
     start_line: int | None = None,
     end_line: int | None = None,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return git_blame_impl(
@@ -733,12 +849,14 @@ def git_blame(
     annotations=OPEN_WORLD_WRITE_TOOL,
     description="Run a local shell command now or queue it as a background task for wait_task/get_task polling.",
 )
+@scoped_tool
 @traced("run_command", result_fn=_run_command_result_summary)
 def run_command(
     command: str,
     cwd: str | None = None,
     timeout: int | None = None,
     run_in_background: bool = False,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     effective_timeout = timeout if timeout is not None else COMMAND_TIMEOUT
@@ -764,11 +882,13 @@ def run_command(
         "stream-like polling via get_task/wait_task."
     ),
 )
+@scoped_tool
 @traced("run_command_stream", result_fn=_task_result_summary)
 def run_command_stream(
     command: str,
     cwd: str | None = None,
     timeout: int | None = None,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     effective_timeout = timeout if timeout is not None else COMMAND_TIMEOUT
@@ -795,6 +915,7 @@ def run_command_stream(
         "capture JSON output as structured_output."
     ),
 )
+@scoped_tool
 @traced("delegate_task", result_fn=_task_result_summary)
 def delegate_task(
     task: str | None = None,
@@ -808,6 +929,7 @@ def delegate_task(
     timeout: int | None = None,
     output_schema: dict[str, object] | None = None,
     parse_structured_output: bool = True,
+    run_id: str | None = None,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return registry.submit(
@@ -831,8 +953,10 @@ def delegate_task(
     annotations=READ_ONLY_TOOL,
     description="Get task status and bounded output. Omit cursor for legacy tails, use cursor='start' to read from the beginning, then next_cursor for incremental reads. completed and has_more are independent. output_truncated means excess log data was discarded.",
 )
+@scoped_tool
 @traced("get_task", result_fn=_task_result_summary)
-def get_task(task_id: str, cursor: str | None = None, max_bytes: int = config.LOG_READ_BYTES) -> dict[str, object]:
+def get_task(task_id: str, cursor: str | None = None, max_bytes: int = config.LOG_READ_BYTES,
+             run_id: str | None = None) -> dict[str, object]:
     return registry.get(task_id, cursor=cursor, max_bytes=max_bytes)
 
 
@@ -842,10 +966,11 @@ def get_task(task_id: str, cursor: str | None = None, max_bytes: int = config.LO
     annotations=READ_ONLY_TOOL,
     description="Wait up to 30 seconds (zero polls immediately) for task completion; return_on_output also wakes on new output. Pass cursor from get_task for incremental logs. wait_timed_out does not cancel execution; execution_timed_out records the command deadline separately.",
 )
+@scoped_tool
 @traced("wait_task", result_fn=_task_result_summary)
 def wait_task(task_id: str, timeout: float = 30, poll_interval: float = 0.5,
               cursor: str | None = None, max_bytes: int = config.LOG_READ_BYTES,
-              return_on_output: bool = False) -> dict[str, object]:
+              return_on_output: bool = False, run_id: str | None = None) -> dict[str, object]:
     return registry.wait(task_id, timeout=timeout, poll_interval=poll_interval,
                          cursor=cursor, max_bytes=max_bytes, return_on_output=return_on_output)
 
@@ -856,8 +981,9 @@ def wait_task(task_id: str, timeout: float = 30, poll_interval: float = 0.5,
     annotations=LOCAL_WRITE_TOOL,
     description="Request process-group cancellation and wait briefly for confirmed cleanup. cancelled=true only after confirmed termination; cancel_requested alone is not completion. Terminal tasks keep their result. Unowned tasks cannot be cancelled by this process.",
 )
+@scoped_tool
 @traced("cancel_task", result_fn=_task_result_summary)
-def cancel_task(task_id: str) -> dict[str, object]:
+def cancel_task(task_id: str, run_id: str | None = None) -> dict[str, object]:
     return registry.cancel(task_id)
 
 

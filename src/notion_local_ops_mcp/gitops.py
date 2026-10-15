@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from .workspaces import WorkError, current_scope
+
 
 def _error(code: str, message: str, **extra: object) -> dict[str, object]:
     payload: dict[str, object] = {
@@ -47,6 +49,9 @@ def _require_repo(cwd: Path) -> tuple[Path, str] | dict[str, object]:
             stderr=root_result.stderr.strip(),
         )
 
+    scope = current_scope.get()
+    if scope:
+        scope.check(Path(root_result.stdout.strip()).resolve())
     branch_result = _run_git(["branch", "--show-current"], cwd=cwd)
     branch = branch_result.stdout.strip() or "HEAD"
     return Path(root_result.stdout.strip()), branch
@@ -55,6 +60,11 @@ def _require_repo(cwd: Path) -> tuple[Path, str] | dict[str, object]:
 def _normalize_pathspec(pathspec: str, *, cwd: Path, repo_root: Path) -> str:
     raw = Path(pathspec).expanduser()
     absolute = (cwd / raw).resolve(strict=False) if not raw.is_absolute() else raw.resolve(strict=False)
+    scope = current_scope.get()
+    if scope:
+        if pathspec.startswith(":"):
+            raise WorkError("scope_conflict", "Scoped Git tools require plain paths, not pathspec magic.")
+        scope.check(absolute)
     try:
         return str(absolute.relative_to(repo_root))
     except ValueError:

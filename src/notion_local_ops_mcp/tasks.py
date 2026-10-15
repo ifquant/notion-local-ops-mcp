@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .config import LOG_READ_BYTES
+from .workspaces import WorkError, WorkStore, current_scope
 
 TERMINAL_TASK_STATUSES = {"succeeded", "failed", "cancelled"}
 
@@ -28,6 +29,7 @@ class TaskStore:
         except OSError:
             pass
         self._lock = threading.RLock()
+        self.work = WorkStore(root)
 
     def _task_dir(self, task_id: str) -> Path:
         if not isinstance(task_id, str) or re.fullmatch(r"[0-9a-f]{12}", task_id) is None:
@@ -98,6 +100,15 @@ class TaskStore:
             self._write_text(self._stdout_path(task_id), "")
             self._write_text(self._stderr_path(task_id), "")
             self._write_text(self._summary_path(task_id), "")
+            scope = current_scope.get()
+            if scope is not None:
+                # Persist association before the executor can start; no duplicate status in SQLite.
+                try:
+                    self.work.associate_task(task_id, scope.run_id)
+                except WorkError:
+                    payload.update(status="failed", error="work_association_failed", finished_at=_now())
+                    self._write_text(self._meta_path(task_id), json.dumps(payload, indent=2))
+                    raise
             return payload
 
     def get(self, task_id: str) -> dict[str, object]:

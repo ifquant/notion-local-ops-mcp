@@ -12,7 +12,7 @@ def _call(tool, *args, **kwargs):
     return result
 
 
-def test_server_list_skills_tool_returns_structured_summary(tmp_path: Path) -> None:
+def test_server_list_skills_tool_returns_structured_summary(tmp_path: Path, monkeypatch) -> None:
     from notion_local_ops_mcp import server
 
     workspace_root = tmp_path / "workspace"
@@ -30,7 +30,7 @@ def test_server_list_skills_tool_returns_structured_summary(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    server.WORKSPACE_ROOT = workspace_root
+    monkeypatch.setattr(server, "WORKSPACE_ROOT", workspace_root)
     result = _call(server.list_skills, include_global=False)
 
     assert result["success"] is True
@@ -50,7 +50,7 @@ def test_server_list_skills_tool_returns_structured_summary(tmp_path: Path) -> N
     ]
 
 
-def test_server_list_skills_tool_forwards_new_filter_arguments(tmp_path: Path) -> None:
+def test_server_list_skills_tool_forwards_new_filter_arguments(tmp_path: Path, monkeypatch) -> None:
     from notion_local_ops_mcp import server
 
     captured: dict[str, object] = {}
@@ -61,8 +61,8 @@ def test_server_list_skills_tool_forwards_new_filter_arguments(tmp_path: Path) -
 
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir(parents=True, exist_ok=True)
-    server.WORKSPACE_ROOT = workspace_root
-    server.list_skills_impl = fake_list_skills_impl
+    monkeypatch.setattr(server, "WORKSPACE_ROOT", workspace_root)
+    monkeypatch.setattr(server, "list_skills_impl", fake_list_skills_impl)
 
     result = _call(
         server.list_skills,

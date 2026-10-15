@@ -16,6 +16,7 @@ from pathlib import PureWindowsPath
 from .tasks import TaskStore
 from .config import LOG_RETAIN_BYTES, LOG_READ_BYTES, MAX_WAIT_SECONDS
 from .execution import EXECUTION_SLOTS, ProcessControl, run_process, validate_seconds
+from .workspaces import WorkError
 
 
 TERMINAL_TASK_STATUSES = {"succeeded", "failed", "cancelled"}
@@ -196,6 +197,8 @@ class ExecutorRegistry:
                     self.store.update(task_id, status="failed", error=str(exc)[:1000])
                 except Exception:
                     pass
+            if isinstance(exc, WorkError):
+                return exc.result()
             return {"success": False, "error": {"code": "submit_failed", "message": str(exc)[:1000]}}
         return {"task_id": task_id, "executor": executor, "status": created["status"], "resolved_cwd": str(cwd)}
 

@@ -10,6 +10,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from .config import READ_MAX_LINES, READ_MAX_BYTES, READ_BATCH_FILES, READ_BATCH_BYTES
+from .workspaces import current_scope
 
 
 # Directories we almost never want to return to an agent. Used as a default
@@ -145,6 +146,13 @@ def _iter_filtered(
         return any(fnmatch(name, pat) or fnmatch(rel, pat) for pat in exclude_patterns)
 
     def entry_allowed(entry: Path) -> bool:
+        scope = current_scope.get()
+        if scope is not None:
+            try:
+                if not entry.resolve().is_relative_to(scope.root):
+                    return False
+            except (OSError, RuntimeError):
+                return False
         if allowed is None:
             return True
         try:
